@@ -1,145 +1,125 @@
 # TSScall
 
-Developed by Christopher Lavender, National Institute of Environmental Health Sciences. Based on work by Adam Burkholder, Brian Bennett, and David Fargo.
+Call transcription start sites (TSSs) from nascent-RNA 5′ coverage — PRO-seq,
+Start-seq, and related assays. Given forward and reverse single-nucleotide
+coverage bedGraphs, TSScall reports start sites at annotated gene starts
+(**obsTSS**) and novel/unannotated start sites (**uTSS**, e.g. enhancer-class
+initiation).
 
-## Overview
+![TSScall pipeline](docs/tsscall_logic.svg)
 
-TSScall identifies transcription start sites (TSSs) from Start-seq data (Nechaev et al. *Science*, 2010). TSScall allows for rapid annotation of TSSs across an entire genome.
+## About this fork
 
-## Obtaining TSScall
+This is a fork of [lavenderca/TSScall](https://github.com/lavenderca/TSScall)
+carrying a **performance refactor** of `TSScall.py`. The calling logic and
+statistics are unchanged: the refactored script produces output that is
+**byte-identical** to upstream — verified by md5 on both the BED and detail
+files across every calling mode, on synthetic data and on full-depth real
+PRO-seq data (see [`PERFORMANCE.md`](PERFORMANCE.md)).
 
-TSScall may be downloaded directly from this GitHub repository. TSScall was designed to be run as a standalone Python script that does not require installation or outside dependencies. The only requirement is a standard installation of Python (2.7 or 3).
+What the refactor buys you, at a glance, on our full-depth test dataset:
 
-## Using TSScall
+- Full-depth calling with **no pre-filtering** now runs on a single node in
+  ~15–20 minutes and ~30 GB — a computation the original cannot complete
+  (it exhausts 90 GB and is OOM-killed).
+- Where the original does complete, the refactor is **74–306× faster** with
+  identical output (e.g. 13.2 h → 2.6 min on the densest condition).
 
-TSScall is run from the commandline.
+Full details, benchmarks, and the correctness argument are in
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
-``python TSScall.py [OPTIONS] FORWARD_BEDGRAPH REVERSE_BEDGRAPH CHROMOSOME_SIZES OUTPUT_FILE``
+## Requirements
 
-`FORWARD_BEDGRAPH` and `REVERSE_BEDGRAPH` are bedGraph files describing the coverage of 5' ends from Start-seq reads at single-nucleotide resolution.  Stranded information is required. `FORWARD_BEDGRAPH` and `REVERSE_BEDGRAPH` describe the coverage for the forward (+) strand and the reverse (-) strand, respectively.
+- Python 2.7 or 3.x
+- [`numpy`](https://numpy.org/) (`pip install -r requirements.txt`)
 
-5' end coverage may be calculated from an alignment in BAM format using the [samtools](http://www.htslib.org/) and [bedtools](http://bedtools.readthedocs.io/en/latest/) utility packages.
+> **Note:** upstream TSScall had no third-party dependencies; this fork adds
+> `numpy`, which is used for the compact coverage representation and vectorized
+> reductions.
 
+## Installation
+
+```bash
+git clone https://github.com/YOURORG/TSScall.git
+cd TSScall
+pip install -r requirements.txt
 ```
-samtools view -b -f 0x0040 BAM_FILE | bedtools genomecov -ibam - -bg -5 -strand + > FORWARD_BEDGRAPH
-samtools view -b -f 0x0040 BAM_FILE | bedtools genomecov -ibam - -bg -5 -strand - > REVERSE_BEDGRAPH
+
+## Usage
+
+Inputs are two bedGraphs of single-nucleotide 5′ read counts (forward and
+reverse strand), a chromosome-sizes file, and an output BED path. An annotation
+(GTF) is optional but enables the annotated (obsTSS) pass.
+
+```bash
+python TSScall.py \
+    --annotation_file annotation.gtf \
+    --detail_file EXP_TSScall_detail_file \
+    --set_read_threshold 8 \
+    --annotation_join_distance 500 \
+    --annotation_search_window 1000 \
+    forward.bedGraph reverse.bedGraph chrom.sizes EXP_TSScall_output.bed
 ```
 
-`CHROMOSOME_SIZES` is a text file describing the size of each chromosome/contig in the reference genome. A sample file in this format can be found [here](http://hgdownload.cse.ucsc.edu/goldenPath/hg19/bigZips/hg19.chrom.sizes). For well-established genomes, we recommend generating this file using the USCS `fetchChromosomeSizes` script, found [here](http://hgdownload.cse.ucsc.edu/admin/exe/linux.x86_64/).
+Positional arguments, in order: `forward.bedGraph reverse.bedGraph
+chrom.sizes output.bed`.
 
-Usage information may be found by running `python TSScall.py --help`.
+### Common options
 
-### Optional arguments
+| Option | Meaning |
+|---|---|
+| `--set_read_threshold N` | Fixed calling threshold. If omitted, a threshold is chosen by the built-in FDR (Poisson) model. |
+| `--annotation_file FILE` | GTF of annotated transcripts; drives the obsTSS pass. |
+| `--detail_file FILE` | Per-TSS detail output (type, reads, bidirectional/cluster info). |
+| `--annotation_search_window N` | Half-width of the window placed around each annotated TSS. |
+| `--annotation_join_distance N` | Distance within which nearby annotated TSSs are merged. |
+| `--call_method {bin_winner,global}` | Per-window caller (see diagram). `bin_winner` (default) favors diffuse coverage; `global` takes the single highest position. |
 
-`--annotation, -a ANNOTATION_FILE`
+Run `python TSScall.py --help` for the complete list.
 
-Sets annotation fie.  The annotation file must be in GTF format.
+### Recommendation: do not pre-filter the input
 
-Setting the annotation file affects how TSScall identifies TSSs. If an annotation file is used, TSScall will first search for TSSs within regions centered on annotation-defined TSSs before searching for unannotated TSSs.
+A common workaround for the original script's memory use was to strip
+low-count positions from the bedGraphs before running. **This is unnecessary
+with the refactor and is lossy under `bin_winner`** — it perturbs ~1–2 % of
+calls at a matched threshold and lets the pre-filter floor silently override a
+lower `--set_read_threshold`. Feed full-depth bedGraphs and control the
+threshold with `--set_read_threshold`. The rationale and measurements are in
+[`PERFORMANCE.md`](PERFORMANCE.md#pre-filtering-is-unnecessary-and-lossy).
 
-`--detail_file DETAIL_FILE`
+## Output
 
-If a detail_file is set, additional information not found in the output BED file will be added to a tab-delimited TXT file.
+- **BED** — all called TSSs (obsTSS + uTSS), one feature per called start.
+- **Detail file** (`--detail_file`) — per-TSS metadata: type, read count,
+  bidirectional pairing, and cluster assignment.
 
-`--cluster_bed CLUSTER_BED`
+## Preserved upstream behaviors
 
-If set, TSScall will associate TSSs into clusters and write these clusters to an unstranded BED file, CLUSTER_BED.
+To guarantee byte-identical output, this fork **intentionally preserves two
+pre-existing behaviors of the original** that silently drop a small amount of
+uTSS signal at the very end of the sorted genome. They are documented, marked
+in the code (`PRESERVED LEGACY BEHAVIOR`), and discussed with their exact scope
+in [`PERFORMANCE.md`](PERFORMANCE.md#preserved-upstream-behaviors). They affect
+only uTSS calls in the terminal region of the last (lexically-sorted)
+chromosome; obsTSS calls are unaffected. Fixing them is a deliberate,
+separate decision — doing so would (correctly) change output relative to
+upstream.
 
-`--calling_method [bin_winner|global]`
+## Validation & benchmarking
 
-Sets the calling method for identifying TSSs. Either `bin_winner` or `global` may be specified.
+The [`benchmark/`](benchmark/) directory contains the SLURM harness used to
+verify correctness and measure performance (original vs. refactored, across
+pre-filter and threshold levels), plus the peak-overlap analyzer and the
+equivalence fuzz tests that prove the two rewritten hot paths match the
+original. See [`benchmark/README.md`](benchmark/README.md) and
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md).
 
-`bin_winner` is the default method used. Here, bins of read coverage are used to select TSSs. This method favors selecting TSSs where the coverage may be locally difuse.
+## Credits
 
-If `global` is set, only individual positions are considered. This method is appropriate when the 5' end coverage is consistently focused on single nucleotide positions.
+TSScall was created by Christopher Lavender, based on work by Adam Burkholder,
+Integrative Bioinformatics, NIEHS. This fork adds a performance refactor by
+YOURORG; the calling logic and statistics are unchanged from upstream.
 
-`--fdr FDR`
+## License
 
-`--false_positives FALSE_POSITIVES`
-
-`--set_read_threshold SET_READ_THRESHOLD`
-
-`--fdr`, `--false_positives`, and `--set_read_threshold` set the method used for the determining the read threshold for a valid TSS. Only one of these three options may be set at a time.
-
-If `--fdr` is set, the read threshold is determined by using the associated FDR.  The read threshold for a valid TSS will be the minimum read count with an expected FDR less than the set FDR value. This is the default method, with a default FDR of 0.001.
-
-If `--false_positives` is set, the read threshold is determined by considering FALSE_POSITIVES to be the maximum number of allowed false positives.  The read threshold will be the minimum read count where the number of expected false positives will be less than the specified value.
-
-If `--set_read_threshold` is set, the read threshold is set the user-defined count. This is useful for setting the threshold by eye or for using outside methods.
-
-`--bidirectional_threshold BIDIRECTIONAL_THRESHOLD`
-
-TSScall associates TSSs into bidirectional pairs. These associations are noted in the detail file. This parameter sets the allowed distance threshold for bidirectional TSS association. The default value is 1000.
-
-`--cluster_threshold CLUSTER_THRESHOLD`
-
-TSScall associates TSSs into clusters by proximity. These clusters may be helpful for super enhancer determination. This parameter sets the allowed distance threshold for cluster association. The default value is 1000.
-
-`--annotation_search_window ANNOTATION_SEARCH_WINDOW`
-
-Search windows are made about each TSS in an annotation file.  This parameter determines the size of the annotation search window by setting the maximum distance away from an annotated TSS that a TSS may be called. The default value is 1000.
-
-`--annotation_join_distance ANNOTATION_JOIN_DISTANCE`
-
-In some annotations, TSSs may be very close in space.  If within the annotation join distance, annotation search windows will be merged, resulting in a single call for the merged windows. The default value is 200.
-
-`--utss_search_window NUTSS_SEARCH_WINDOW`
-
-Sets the distance between which unannotated TSSs may be called.  No two uTSSs may be closer than the uTSS search window apart. The default value is 250.
-
-`--utss_filter_size NUTSS_FILTER_SIZE`
-
-If an annotation is specified, TSScall will first search for TSSs near annotated start sites of gene models before calling additional unannotated TSSs. Prior to calling unannotated TSSs, reads are filtered and not considered in unannotated TSS calling if they are near annotated TSSs. Reads are filtered if they are within the uTSS filter size of either an annotated TSS or TSS called from annotation. The default uTSS filter size is 750.
-
-### Output files
-
-#### BED output file
-
-The standard output file for TSScall is a list of TSSs in [BED format](http://genome.ucsc.edu/FAQ/FAQformat#format1). Entries are sorted by chromosome and position. TSSs are arbitrarily named by order of strand and position. By default, a TSS name will have the 'uTSS' prefix. If a TSS corresponds to a transcript in an input annotation, its name will have the 'obsTSS' prefix. The associated transcript can be found in the optional detail file.  
-
-No information is stored in the score column (column 5). A placeholder value of '0' is used to maintain the BED file format.
-
-#### Detail file
-
-The optional detail file contains additional information about each TSS in a tab-delimited TXT file. Column headers are as follows:
-
-* **TSS ID** Name assigned by TSS call.
-* **Type** Type of TSS called. Available types are ...
-* **Transcripts** Semi-colon delimited list of transcript IDs if the TSS was called from annotation.
-* **Gene ID** Semi-colon delimited list of gene IDs if the TSS was called from annotation.
-* **Strand**
-* **Chromosome**
-* **Position**
-* **Reads** Coverage of 5' ends at the called TSS.
-* **Divergent?** Boolean field describing whether or not a divergent TSS was called.
-* **Divergent partner** If divergent, gives the assigned ID of the divergent TSS.
-* **Divergent distance** The distance from the TSS to its divergent partner.
-* **Convergent?** Boolean field describing whether or not a convergent TSS was called.
-* **Convergent partner** If convergent, gives the assigned ID of the convergent TSS.
-* **Convergent distance** The distance from the TSS to its convergent partner.
-* **TSS cluster** TSScall will associate TSSs into clusters based on proximity. Gives the assigned ID of the cluster.
-* **TSSs in associated cluster** Gives the number of TSSs in the associated cluster. May be helpful in identifying super enhancers.
-
-The detail file also includes any additional information found in the attribute field of the [GTF file](https://useast.ensembl.org/info/website/upload/gff.html). Additional information will have headers consistent with the GTF annotation.
-
-#### Cluster BED file
-
-TSScall will associate TSSs into clusters based on proximity. This file gives the location of TSS clusters in [BED format](http://genome.ucsc.edu/FAQ/FAQformat#format1).
-
-## Utilities for annotation of results
-
-Within the /utils directory are scripts for annotation of TSScall results. Additional scripts may be present in the /utils directory; these scripts may be under development or designed for niche functions.
-
-We recommend follow-up analysis with TSSclassify to associate called TSSs with gene models.
-
-### TSSclassify
-
-```perl TSSclassify.pl DETAIL_FILE GTF_ANNOTATION_FILE```
-
-TSSclassify is a perl script that annotates a TSScall detail file with information from a GTF annotation.
-
-### TSScompare
-
-```python TSScompare.py BED_FILE_1 BED_FILE_2```
-
-TSScompare considers two BED files and finds TSSs shared between them. An optional `--distance_threshold INTEGER` or `-d INTEGER` flag may be used to set a distance threshold; any TSSs within this distance threshold will be considered shared. Additional usage information can be found using `python TSScompare.py --help`.
+See [`LICENSE`](LICENSE) (retained from upstream lavenderca/TSScall).
