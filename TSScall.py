@@ -4,12 +4,45 @@
 # BASED ON WORK BY ADAM BURKHOLDER
 # INTEGRATIVE BIOINFORMATICS, NIEHS
 # WORKING OBJECT ORIENTED VERSION
+#
+# ---------------------------------------------------------------------------
+# PERFORMANCE REFACTOR (single-node). Statistical approach UNCHANGED.
+# Verified to produce byte-identical BED and detail output to the original
+# across bin_winner / global / FDR / no-annotation configurations, plus unit
+# fuzz tests for the two rewritten hot paths.
+#
+# Changes, each result-preserving:
+#   1. bin_winner TSS selection: O(H^2) per window -> O(H) via a two-pointer +
+#      prefix sum. Same OVERLAPPING, hit-anchored sliding windows as the
+#      original (NOT fixed tiling); identical totals and identical tie-breaking.
+#   2. bedGraph storage: one Python dict per single-nt position (~350 B) ->
+#      compact per-(strand,chromosome) int64 numpy arrays (~16-24 B). This is
+#      what removes the memory wall that forced pre-filtering.
+#   3. countLoci / total read count: vectorized (identical values).
+#   4. Window merges in createSearchWindowsFromAnnotation and
+#      createUnannotatedSearchWindowsFromBedgraph: list.pop(0) O(n^2) -> index
+#      cursor O(n) (identical output order).
+#
+# Requires numpy. Python 2.7 or 3.
+#
+# TWO PRE-EXISTING BEHAVIORS ARE PRESERVED VERBATIM so that output matches the
+# original exactly. Both silently discard data and are almost certainly bugs;
+# they are left intact and clearly marked (search "PRESERVED LEGACY BEHAVIOR")
+# so the decision to keep or fix them is explicit, not accidental:
+#   (a) filterBedGraphListByWindows drops every bedGraph position ordered after
+#       the last filter window (uTSS candidates past the last known TSS).
+#   (b) createUnannotatedSearchWindowsFromBedgraph drops the final (highest-
+#       sorted) uTSS search window.
+# ---------------------------------------------------------------------------
 
 import os
 import math
 import argparse
 import sys
 from operator import itemgetter
+from array import array
+
+import numpy as np
 
 
 def writeBedHeader(file_name, description, OUTPUT):
@@ -129,6 +162,59 @@ def readInReferenceAnnotation(annotation_file):
     return reference_annotation, all_gtf_keys
 
 
+def _group_cmp(a_strand, a_chrom, b_strand, b_chrom):
+    # Mirrors the (strand, chromosome) key ordering used by isLessThan and
+    # sortList: plain Python string comparison, strand first then chromosome.
+    if a_strand != b_strand:
+        return -1 if a_strand < b_strand else 1
+    if a_chrom != b_chrom:
+        return -1 if a_chrom < b_chrom else 1
+    return 0
+
+
+class BedGraph(object):
+    # Compact, behavior-preserving replacement for the original
+    # list-of-single-nucleotide-dicts. In the original, combineAndSortBedGraphs
+    # produced one dict per single-nt position
+    #     {'chromosome', 'start', 'end', 'reads', 'strand'}   (start == end)
+    # sorted by (strand, chromosome, start). That cost ~340 bytes/position.
+    #
+    # Here, positions are grouped by (strand, chromosome); each group holds two
+    # parallel numpy arrays (pos, reads) in ascending-position order (~8 bytes
+    # per int). Iterating self.order (sorted keys) and, within each group, the
+    # pos array ascending, reproduces the EXACT global order that
+    # sortList(..., 'sort_by_strand') produced on the original list, because:
+    #   - the original sort key is (strand_str, chromosome_str, start_int);
+    #   - sorted() over (strand, chromosome) tuple keys uses the same string
+    #     comparison for the first two fields;
+    #   - positions are unique within a (strand, chromosome) group (bedtools
+    #     genomecov emits non-overlapping intervals per strand), so the third
+    #     field is a total order with no ties.
+    # 'end' is dropped because it always equalled 'start'; every original read
+    # of entry['end'] is reproduced by using the position.
+    def __init__(self):
+        self.groups = {}   # (strand, chrom) -> {'pos': ndarray, 'reads': ndarray}
+        self.order = []    # sorted list of (strand, chrom) keys
+
+    def add_group(self, key, pos, reads):
+        self.groups[key] = {'pos': pos, 'reads': reads}
+
+    def finalize_order(self):
+        self.order = sorted(self.groups.keys())
+
+    def total_reads(self):
+        # == sum(entry['reads'] for entry in bedgraph_list)
+        return int(sum(int(g['reads'].sum()) for g in self.groups.values()))
+
+    def count_loci(self, value):
+        # == countLoci(bedgraph_list, value): number of single-nt positions
+        # whose read count is >= value.
+        loci = 0
+        for g in self.groups.values():
+            loci += int(np.count_nonzero(g['reads'] >= value))
+        return loci
+
+
 class TSSCalling(object):
 
     def __init__(self, **kwargs):
@@ -245,9 +331,15 @@ class TSSCalling(object):
         # MERGE WINDOWS BASED PROXIMITY;
         # IF WINDOWS ARE WITHIN JOIN THRESHOLD, THEY ARE MERGED;
         # IF NOT, BUT STILL OVERLAPPING, MIDPOINT BECOMES BOUNDARY
-        working_entry = transcript_list.pop(0)
-        while len(transcript_list) != 0:
-            next_entry = transcript_list.pop(0)
+        # NOTE: index cursor instead of transcript_list.pop(0). pop(0) is O(W)
+        # per call -> O(W^2) overall for W transcripts; the cursor is O(W).
+        # Output order and merge logic are unchanged.
+        _tl_idx = 0
+        working_entry = transcript_list[_tl_idx]
+        _tl_idx += 1
+        while _tl_idx < len(transcript_list):
+            next_entry = transcript_list[_tl_idx]
+            _tl_idx += 1
             if (working_entry['strand'] == next_entry['strand']) and \
                     (working_entry['chromosome'] == next_entry['chromosome']):
                 if working_entry['tss'][-1] + join_window >= \
@@ -283,25 +375,48 @@ class TSSCalling(object):
         return merged_windows
 
     def combineAndSortBedGraphs(self, forward_bedgraph, reverse_bedgraph):
+        # Behavior-preserving compact reader. Same line filtering and same
+        # single-nucleotide expansion as the original readBedGraph (a line
+        # spanning [start, end) contributes one position per integer in
+        # range(start+1, end+1), each carrying the line's read count), but
+        # positions accumulate into C-backed int64 arrays grouped by
+        # (strand, chromosome) instead of one Python dict each.
 
-        def readBedGraph(bedgraph_list, bedgraph_fn, strand):
+        def readBedGraph(acc, bedgraph_fn, strand):
             with open(bedgraph_fn) as f:
                 for line in f:
                     if not ('track' in line or line == '\n'):
                         chromosome, start, end, reads = line.strip().split()
-                        for i in range(int(start)+1, int(end)+1):
-                            bedgraph_list.append({
-                                'chromosome': chromosome,
-                                'start': i,
-                                'end': i,
-                                'reads': int(reads),
-                                'strand': strand
-                                })
+                        start = int(start)
+                        end = int(end)
+                        reads = int(reads)
+                        key = (strand, chromosome)
+                        pair = acc.get(key)
+                        if pair is None:
+                            pair = [array('q'), array('q')]
+                            acc[key] = pair
+                        pos_arr, read_arr = pair
+                        for i in range(start + 1, end + 1):
+                            pos_arr.append(i)
+                            read_arr.append(reads)
 
-        combined_list = []
-        readBedGraph(combined_list, forward_bedgraph, '+')
-        readBedGraph(combined_list, reverse_bedgraph, '-')
-        return sortList(combined_list, 'sort_by_strand')
+        acc = {}
+        readBedGraph(acc, forward_bedgraph, '+')
+        readBedGraph(acc, reverse_bedgraph, '-')
+
+        bg = BedGraph()
+        for key in list(acc.keys()):
+            pos_arr, read_arr = acc.pop(key)
+            pos_v = np.frombuffer(pos_arr, dtype=np.int64)
+            read_v = np.frombuffer(read_arr, dtype=np.int64)
+            # Sort within group by position (== sortList's 'start' key; strand
+            # and chromosome are constant within a group). Positions are unique
+            # per group, so ordering is fully determined.
+            order = np.argsort(pos_v, kind='stable')
+            bg.add_group(key, np.array(pos_v[order]), np.array(read_v[order]))
+            del pos_arr, read_arr, pos_v, read_v, order
+        bg.finalize_order()
+        return bg
 
     # CONSIDERS TAB-DELIMITED CHROM_SIZES FILE (UCSC)
     def findGenomeSize(self, chrom_sizes):
@@ -316,18 +431,13 @@ class TSSCalling(object):
     def findReadThreshold(self, bedgraph_list, genome_size):
 
         def countLoci(bedgraph_list, value):
-            loci = 0
-            for entry in bedgraph_list:
-                if entry['reads'] >= value:
-                    loci += 1
-            return loci
+            # Identical result to the original per-entry loop; vectorized.
+            return bedgraph_list.count_loci(value)
 
         if self.fdr_threshold or self.false_positives:
             self.false_positives = 1
             mappable_size = 0.8 * 2 * float(genome_size)
-            read_count = 0
-            for entry in bedgraph_list:
-                read_count += entry['reads']
+            read_count = bedgraph_list.total_reads()
             expected_count = float(read_count)/mappable_size
 
             cume_probability = ((expected_count**0)/math.factorial(0)) * \
@@ -354,20 +464,37 @@ class TSSCalling(object):
     # FIND INTERSECTION WITH SEARCH_WINDOWS, BEDGRAPH_LIST;
     # HITS ARE ADDED TO WINDOW_LIST, REQUIRES SORTED LIST
     def findIntersectionWithBedGraph(self, search_windows, bedgraph_list):
-        search_index = 0
-        bedgraph_index = 0
-        while (search_index < len(search_windows)) and \
-                (bedgraph_index < len(bedgraph_list)):
-            if isWithin(bedgraph_list[bedgraph_index],
-                        search_windows[search_index]):
-                search_windows[search_index]['hits'].append([
-                    bedgraph_list[bedgraph_index]['start'],
-                    bedgraph_list[bedgraph_index]['reads']
-                    ])
-                bedgraph_index += 1
-            else:
-                if isLessThan(bedgraph_list[bedgraph_index],
-                              search_windows[search_index]):
+        # In the original global merge-walk, a hit is recorded only when the
+        # bedGraph position and the window share strand AND chromosome (isWithin
+        # requires it); across (strand, chromosome) boundaries the walk merely
+        # advances indices. Grouping the (already globally-sorted) windows by
+        # (strand, chromosome) and walking each group's positions against its
+        # windows therefore produces identical hits and identical window order.
+        # search_windows is globally sorted, so per-key window lists stay sorted
+        # by start.
+        windows_by_key = {}
+        for w in search_windows:
+            windows_by_key.setdefault(
+                (w['strand'], w['chromosome']), []).append(w)
+
+        for key, win_list in windows_by_key.items():
+            group = bedgraph_list.groups.get(key)
+            if group is None:
+                continue
+            pos = group['pos']
+            reads = group['reads']
+            n = len(pos)
+            nw = len(win_list)
+            bedgraph_index = 0
+            search_index = 0
+            while (search_index < nw) and (bedgraph_index < n):
+                w = win_list[search_index]
+                p = pos[bedgraph_index]
+                if w['start'] <= p <= w['end']:          # isWithin (same group)
+                    w['hits'].append(
+                        [int(p), int(reads[bedgraph_index])])
+                    bedgraph_index += 1
+                elif p < w['start']:                     # isLessThan (same group)
                     bedgraph_index += 1
                 else:
                     search_index += 1
@@ -402,46 +529,108 @@ class TSSCalling(object):
         return sortList(filter_windows, 'sort_by_strand')
 
     def filterBedGraphListByWindows(self, bedgraph_list, filter_windows):
-        # FILTER BY OVERLAP WITH FILTER WINDOWS
-        if filter_windows != []:
-            filter_index = 0
+        # FILTER BY OVERLAP WITH FILTER WINDOWS.
+        # Faithful reproduction of the original single global merge-walk over
+        # the sorted bedGraph vs. the sorted filter_windows, operating on the
+        # grouped arrays. A single global filter-window cursor (filter_index) is
+        # carried across (strand, chromosome) groups so that cross-group
+        # advancement matches isLessThan exactly.
+        #
+        # PRESERVED LEGACY BEHAVIOR (do not "fix" without a decision):
+        #   The original while-loop terminates as soon as filter_index reaches
+        #   the end of filter_windows, so any bedGraph positions ordered AFTER
+        #   the last filter window are dropped (they never reach working_list) --
+        #   both the remainder of the current group and every later group. This
+        #   silently discards uTSS candidates past the last filter window. It is
+        #   reproduced verbatim here; see the '_tail_dropped' break below.
+        if filter_windows == []:
+            return bedgraph_list
+
+        FW = filter_windows
+        nfw = len(FW)
+        filter_index = 0
+        new_bg = BedGraph()
+
+        for key in bedgraph_list.order:
+            if filter_index >= nfw:
+                break  # legacy tail-drop: remaining groups discarded
+            strand, chrom = key
+            group = bedgraph_list.groups[key]
+            pos = group['pos']
+            reads = group['reads']
+            n = len(pos)
+            keep = np.zeros(n, dtype=bool)
             bedgraph_index = 0
-            working_list = []
-            while (filter_index < len(filter_windows)) and \
-                    (bedgraph_index < len(bedgraph_list)):
-                if isWithin(bedgraph_list[bedgraph_index],
-                            filter_windows[filter_index]):
-                    bedgraph_index += 1
-                else:
-                    if isLessThan(bedgraph_list[bedgraph_index],
-                                  filter_windows[filter_index]):
-                        working_list.append(bedgraph_list[bedgraph_index])
+            while (filter_index < nfw) and (bedgraph_index < n):
+                w = FW[filter_index]
+                gc = _group_cmp(strand, chrom, w['strand'], w['chromosome'])
+                if gc == 0:
+                    p = pos[bedgraph_index]
+                    if w['start'] <= p <= w['end']:      # within -> drop
                         bedgraph_index += 1
-                    else:
+                    elif p < w['start']:                 # before window -> keep
+                        keep[bedgraph_index] = True
+                        bedgraph_index += 1
+                    else:                                # past window -> advance
                         filter_index += 1
-            bedgraph_list = working_list
-        return bedgraph_list
+                elif gc < 0:                             # bg group < window group
+                    keep[bedgraph_index] = True          #   isLessThan -> keep
+                    bedgraph_index += 1
+                else:                                    # window group < bg group
+                    filter_index += 1                    #   advance window
+            # positions not reached before filter windows ran out are dropped
+            idx = np.nonzero(keep)[0]
+            if len(idx):
+                new_bg.add_group(key, pos[idx], reads[idx])
+
+        new_bg.finalize_order()
+        return new_bg
 
     # CREATES WINDOWS FOR UNANNOTATED TSS CALLING
     def createUnannotatedSearchWindowsFromBedgraph(self,
                                                    bedgraph_list,
                                                    read_threshold):
+        # Seed one window per qualifying position (reads strictly > threshold),
+        # in the same global sorted order the original produced by iterating the
+        # sorted bedgraph_list. entry['end'] == entry['start'] == position, so
+        # end + utss_search_window becomes position + utss_search_window.
         windows = []
-        for entry in bedgraph_list:
-            if entry['reads'] > read_threshold:
+        for key in bedgraph_list.order:
+            strand, chromosome = key
+            group = bedgraph_list.groups[key]
+            pos = group['pos']
+            reads = group['reads']
+            sel = np.nonzero(reads > read_threshold)[0]
+            for i in sel:
+                p = int(pos[i])
                 windows.append({
-                    'strand': entry['strand'],
-                    'chromosome': entry['chromosome'],
-                    'start': entry['start'] - self.utss_search_window,
-                    'end': entry['end'] + self.utss_search_window,
+                    'strand': strand,
+                    'chromosome': chromosome,
+                    'start': p - self.utss_search_window,
+                    'end': p + self.utss_search_window,
                     'hits': []
                     })
 
-        # MERGE OVERLAPPING WINDOWS
+        # MERGE OVERLAPPING WINDOWS.
+        # index cursor instead of windows.pop(0): pop(0) is O(len(windows)) per
+        # call -> O(M^2) for M qualifying positions (can be very large on deep
+        # data); the cursor is O(M). Merge logic and output order are unchanged.
+        #
+        # PRESERVED LEGACY BEHAVIOR (do not "fix" without a decision): the
+        # original does NOT append the final working_entry after the loop, so
+        # the last (highest-sorted) uTSS window is dropped. Reproduced verbatim.
         merged_windows = []
-        working_entry = windows.pop(0)
-        while len(windows) != 0:
-            next_entry = windows.pop(0)
+        if len(windows) == 0:
+            # The original would raise IndexError on windows.pop(0) here; on real
+            # data there is always >=1 qualifying position, so this guard only
+            # changes the degenerate empty case (returns [] instead of crashing).
+            return merged_windows
+        _w_idx = 0
+        working_entry = windows[_w_idx]
+        _w_idx += 1
+        while _w_idx < len(windows):
+            next_entry = windows[_w_idx]
+            _w_idx += 1
             if (working_entry['strand'] == next_entry['strand']) and\
                     (working_entry['chromosome'] == next_entry['chromosome']):
                 if working_entry['end'] >= next_entry['start']:
@@ -807,34 +996,41 @@ class TSSCalling(object):
                 return max_position, max_reads
             if self.call_method == 'bin_winner':
                 bin_size = self.bin_winner_size
-                bins = []
-                # MAKE BINS
+                # O(H) EQUIVALENT OF THE ORIGINAL O(H^2) BINNING.
+                # ORIGINAL: one OVERLAPPING bin anchored at every hit i,
+                # covering [pos_i, pos_i + bin_size] (forward span, because
+                # hits are position-sorted and j runs from i upward). This
+                # slides a hit-anchored window; it does NOT tile the axis.
+                # Two-pointer reproduces the identical bins/totals/ties.
                 hits.sort(key=itemgetter(0))
-                for i in range(len(hits)):
-                    bins.append({
-                        'total_reads': 0,
-                        'bin_hits': []
-                        })
-                    for j in range(i, len(hits)):
-                        if abs(hits[i][0] - hits[j][0]) <= bin_size:
-                            bins[-1]['total_reads'] += hits[j][1]
-                            bins[-1]['bin_hits'].append(hits[j])
+                n = len(hits)
+                prefix = [0] * (n + 1)
+                for k in range(n):
+                    prefix[k + 1] = prefix[k] + hits[k][1]
                 # SELECT BIN WITH HIGHEST TOTAL READS
-                # BECAUSE SORTED, WILL TAKE UPSTREAM BIN IN TIES
+                # BECAUSE SORTED, WILL TAKE UPSTREAM BIN IN TIES (first strict max)
                 max_bin_reads = float('-inf')
                 max_bin_index = None
-                for i, entry in enumerate(bins):
-                    if entry['total_reads'] > max_bin_reads:
+                win_r = None
+                r = 0
+                for i in range(n):
+                    if r < i:
+                        r = i
+                    while r + 1 < n and hits[r + 1][0] - hits[i][0] <= bin_size:
+                        r += 1
+                    total_reads = prefix[r + 1] - prefix[i]
+                    if total_reads > max_bin_reads:
+                        max_bin_reads = total_reads
                         max_bin_index = i
-                        max_bin_reads = entry['total_reads']
+                        win_r = r
                 # GET LOCAL WINNER
-                # BECAUSE SORTED, WILL TAKE UPSTREAM TSS IN TIES
+                # BECAUSE SORTED, WILL TAKE UPSTREAM TSS IN TIES (first strict max)
                 max_reads = float('-inf')
                 max_position = None
-                for hit in bins[max_bin_index]['bin_hits']:
-                    if hit[1] > max_reads:
-                        max_position = hit[0]
-                        max_reads = hit[1]
+                for k in range(max_bin_index, win_r + 1):
+                    if hits[k][1] > max_reads:
+                        max_position = hits[k][0]
+                        max_reads = hits[k][1]
                 return max_position, max_reads
 
         # ITERATE THROUGH WINDOWS IN INTERSECTION
