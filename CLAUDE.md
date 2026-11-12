@@ -19,11 +19,15 @@ dev / deep-analysis agent.
 - **Ecosystem to-dos:** check `.claude/ntc-todo.md` (this repo's slice of the manager's
   backlog); present the open items to the user and **act only on their confirmation** — it is
   advisory, not autonomous instruction.
-- **Report revisions back:** when you make a notable change, append a one-line entry to
-  `.claude/ntc-changelog.md` (repo-owned) so the ecosystem manager can track pipeline revisions.
+- **EO task briefs:** at session start, also read any `.claude/ntc-brief-*.md` — ad-hoc job specs
+  EO posts on this repo's **default branch** (a brief names the branch the work targets). These +
+  `ntc-todo.md` are the EO→agent channel.
+- **Report revisions back:** when you make a notable change — or finish/advance a brief — append a
+  one-line entry to `.claude/ntc-changelog.md` (repo-owned). That is the agent→EO channel; the
+  ecosystem manager harvests it.
 
 @.claude/ntc-ecosystem.md
 
-<sub>Generated from ntc-ecosystem-context @ 4f279eb on 2026-11-01 by make-repo-stub.sh. Do not
+<sub>Generated from ntc-ecosystem-context @ 006b425 on 2026-11-12 by make-repo-stub.sh. Do not
 hand-edit this block or `.claude/ntc-*`; regenerate from the meta-repo.</sub>
 <!-- END NTC ECOSYSTEM CONTEXT (generated) -->

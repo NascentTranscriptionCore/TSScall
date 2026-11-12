@@ -262,12 +262,15 @@ their cluster submit command and inherit smart sizing (see smartSlurm `bin/Snake
 
 ---
 
-## 7. slurmless — now vendored in-tree
-The former standalone `slurmless_smartSlurm_testing` repo is **archived**; its successor lives
-as the **`slurmless/` subdirectory of smartSlurm** and is where all future slurmless dev
-continues. It is a Slurm-free regression harness for smartSlurm *itself* (mock `sbatch`/
-`sacct`, fixtures, resource models), not wired to the NTC pipelines. Layout:
-`slurmless/bootstrap.sh`, `slurmless/test/run_tests.sh` (≈41 test blocks),
-`slurmless/test/checkrun_ui_tests.sh`, `slurmless/test/mockSlurm/`, fixtures + models, and a
-skill stub `slurmless/.claude/skills/slurmless-harness/SKILL.md`. Use it to prototype an rAP
-conversion or a resource-estimation change without a cluster.
+## 7. slurmless — the Slurm-free test harness (now in-tree)
+slurmless is a Slurm-free regression harness for smartSlurm *itself* (mock `sbatch`/`sacct`,
+fixtures, resource models; **~64 test blocks**), not wired to the NTC pipelines. It is **merged
+in-tree at `smartSlurm/slurmless/`** (PR #144, 2026-11-11; the standalone repo
+`ntc-agnt/slurmless_smartSlurm_testing` is now **deprecated**) — layout under `slurmless/`:
+`bootstrap.sh`, `test/run_tests.sh`, `test/checkrun_ui_tests.sh`, `test/lib/harness.sh`,
+`test/mockSlurm/`, fixtures + models, `skills/` (the harness, `smartslurm-adversary`, and
+`migration-assistant` skills), and `agents/`. One copy, versioned with the engine, unable to drift.
+Use it to prototype an rAP conversion or a resource-estimation change without a cluster.
+**Co-versioning rule:** any smartSlurm engine change must ship with a paired slurmless harness
+update and be run through `smartslurm-adversary` before on-cluster testing or an upstream push.
+→ skills `slurmless-harness`, `smartslurm-adversary`.

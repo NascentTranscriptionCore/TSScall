@@ -17,7 +17,19 @@ repo's deep-analysis agent *and* is aware of the wider NTC ecosystem:
   advisory — surface to the user, act only on confirmation).
 - `.claude/ntc-changelog.md` — **repo-owned** (NOT overwritten): append a line here when you
   make a notable revision, so the ecosystem manager can track it.
+- `.claude/ntc-brief-*.md` — **ad-hoc task briefs from EO** (a specific job spec: what to change,
+  why, how, acceptance test). Posted on this repo's **default branch**; a brief names which branch
+  the actual *work* targets. `ntc-todo.md` indexes any open briefs.
+
+## Comms channel — how notes pass between EO and this repo's agent
+All EO ↔ agent comms live in `.claude/` on this repo's **default branch** (the one branch every
+fresh session sees — so notes are findable without knowing a feature-branch name):
+- **EO → you:** `ntc-ecosystem.md` (standing context) · `ntc-todo.md` (backlog projection + an
+  index of open briefs) · `ntc-brief-<topic>.md` (ad-hoc job specs).
+- **you → EO:** append to `ntc-changelog.md` (repo-owned; EO harvests it).
+- **At session start, read** `ntc-ecosystem.md` + `ntc-todo.md` and `ls .claude/ntc-brief-*.md`
+  on the default branch — even if you then switch to a feature branch to do the work.
 
 Edit the originals in the meta-repo and regenerate (`make-repo-stub.sh` /
 `refresh-ntc-context`); changes here will be overwritten. Generated from
-ntc-ecosystem-context @ 4f279eb on 2026-11-01.
+ntc-ecosystem-context @ 006b425 on 2026-11-12.

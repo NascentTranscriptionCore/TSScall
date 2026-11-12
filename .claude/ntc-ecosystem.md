@@ -24,9 +24,15 @@ build their own `sbatch --dependency` DAGs by hand, which is **not** smartSlurm.
   *Substrate under RNAseqMapping / pipeline2 / DOBBE_F / ChIPseq.* Authoritative branch is
   now **`master`** (the `ux-update` work merged in 2026-10 and that branch was deleted);
   named-flag CLI, `#@end` explicit block closure, **jobRecords v2** history, and
-  `checkRun`/`checkRunGrid`/`diagnose.sh`. The former standalone slurmless test harness is
-  now vendored as its **`slurmless/` subdir**. Use when: writing/modifying any rAP driver.
-  → skill `smartslurm-pipelines`, `reference/runAsPipeline-grammar.md`.
+  `checkRun`/`checkRunGrid`/`diagnose.sh`. The slurmless Slurm-free test harness now lives
+  **in-tree at `smartSlurm/slurmless/`** (merged 2026-11-11, PR #144; the standalone
+  `slurmless_smartSlurm_testing` is **deprecated** — direct all slurmless work at the in-tree copy)
+  and ships three skills: `slurmless-harness` (the harness), `smartslurm-adversary` (pre-push
+  adversarial review), and `migration-assistant` (hand-rolled-SLURM→rAP). **Any smartSlurm change
+  must be paired with a slurmless harness update** (a block that fails without it) and passed through
+  `smartslurm-adversary` before on-cluster testing or an upstream push.
+  Use when: writing/modifying any rAP driver.
+  → skills `smartslurm-pipelines`, `slurmless-harness`, `smartslurm-adversary`; `reference/runAsPipeline-grammar.md`.
 - **Genome_Onboarding** (`genome_setup`) — onboard a reference genome. In: GTF+FASTA
   URLs, spike FASTA, config. Out: UCSC-named `basic.gtf`, bowtie2/STAR/kallisto indexes,
   chrom.sizes, TSS `formakeheatmap` lists → NTC shared storage. Downstream: ~everything.
@@ -86,9 +92,13 @@ build their own `sbatch --dependency` DAGs by hand, which is **not** smartSlurm.
 - **DOBBE_F** (DOBBE, dREG eRNA) — enhancer-RNA calling (**rAP**). In: PRO-seq 3'
   bedGraphs (→ bigWig → dREG, GPU) + GGA dir. Out: filtered/annotated eRNA peaks +
   a make_heatmap v3 anchor file. Upstream: pipeline2 + GGA. Downstream: MHT.
-- **Expression-Matching** (`expressionMatched`) — build expression-matched unchanged-
-  gene control lists. In: DESeq2 output (`results_table`, `makeHeatmap.rds`) + GGA
-  `WORKING_FILE`. Out: `expression_matched-<baseline>_{1,2,3}.txt`. Upstream: DESeq2 + GGA.
+- **Expression-Matching** (`expressionMatched`, `matchit_match`) — matched unchanged-gene
+  control lists for PRO-seq DE. **Restructured 2026-11:** primary entry `matchit_match.R` (flag
+  CLI; default **MatchIt** covariate matcher — expression + optional length/GC/…; legacy decile
+  via `--method expression`, or frozen `archive/main.R`). In: DESeq2 output (`results_table`,
+  `makeHeatmap.rds`) + GGA `WORKING_FILE`. Out: `matched_controls.<method>.txt` (+ SMD-balance/QC
+  plots); legacy path still emits `expression_matched-<baseline>_{1,2,3}.txt`. New dep **MatchIt**
+  (**confirmed ntc_env gap** — in no env YAML; NTC-027a). Upstream: DESeq2 + GGA. Downstream: MHT (controls).
 - **metagene_heatmap_tool** (**MHT**) — metagene + heatmap figures/matrices (Prism-ready).
   In: PRO/TT/ChIP stranded bedGraphs + GGA **or** proTSScall annotation. Hand-rolled
   sbatch DAG. Upstream: mapping bedGraphs + GGA/proTSScall/DOBBE_F anchor. Terminal.
@@ -98,13 +108,16 @@ build their own `sbatch --dependency` DAGs by hand, which is **not** smartSlurm.
   *In flux (2026, pilot-stage) — catalog entry only, no skill yet.*
 
 ## Dev / test
-- **slurmless** (`slurmless_smartSlurm_testing`) — Slurm-free regression harness for
-  **smartSlurm itself** (mock sbatch/sacct + rAP test fixtures). **The standalone repo is
-  ARCHIVED**; slurmless is now vendored as the **`slurmless/` subdirectory of smartSlurm**
-  (≈40 test blocks), where all future dev continues. Not wired to NTC pipelines; useful to
-  prototype rAP conversion / estimator changes without a cluster. Load it to test an rAP driver
-  (incl. ChIPseq) off-cluster before O2. → skill `slurmless-harness` (sourced from
-  `smartSlurm/slurmless`).
+- **slurmless** (`smartSlurm/slurmless/`) — Slurm-free regression harness for **smartSlurm itself**
+  (mock sbatch/sacct + fixtures; **~64 test blocks**, incl. a Migration-Assistant hand-rolled-SLURM→rAP
+  suite). **Merged into smartSlurm 2026-11-11** (PR #144) — it now lives in-tree at `smartSlurm/slurmless/`,
+  versioned with the engine; the standalone repo `slurmless_smartSlurm_testing` is **deprecated** (direct
+  all future slurmless work at the in-tree copy). Carries three skills — `slurmless-harness`,
+  `smartslurm-adversary` (pre-push adversarial review), `migration-assistant` (hand-rolled-SLURM→rAP).
+  Not wired to NTC pipelines; useful to prototype rAP conversion / estimator changes without a cluster.
+  Load it to test an rAP driver (incl. ChIPseq) off-cluster before O2. **Co-versioning rule:** any
+  smartSlurm change ships with a paired slurmless update + an `smartslurm-adversary` review pass.
+  → skills `slurmless-harness`, `smartslurm-adversary`.
 
 ## Ops / QC utilities
 - **utilities** (`ntc-agnt/utilities`) — grab-bag of standalone helper scripts (not smartSlurm). Each has its
@@ -140,7 +153,7 @@ build their own `sbatch --dependency` DAGs by hand, which is **not** smartSlurm.
                                       (dREG eRNA)  heatmap     Matching      _toolkit
                                                    _tool       (+DESeq2)
  smartSlurm = substrate under RNAseqMapping / pipeline2 / DOBBE_F / ChIPseq.
- slurmless (now smartSlurm/slurmless subdir; standalone repo archived) tests smartSlurm itself.
+ slurmless (now in-tree at smartSlurm/slurmless/; standalone repo deprecated) tests smartSlurm itself.
 ```
 
 ## Shared format currency (the glue)
@@ -166,3 +179,14 @@ build their own `sbatch --dependency` DAGs by hand, which is **not** smartSlurm.
   accepted — see `reference/runAsPipeline-grammar.md`.
 - **TSScall ≠ proTSScall** (different mechanisms; proTSScall is not a fork).
 - **make_heatmap** binary (NIH_scripts) is a hard dependency for most analysis tools.
+- **smartSlurm ↔ slurmless are co-versioned.** slurmless now lives in-tree at
+  `smartSlurm/slurmless/` (merged 2026-11-11; the standalone `slurmless_smartSlurm_testing` is
+  **deprecated**). Any smartSlurm engine change must be **paired with a slurmless harness update**
+  (a test block that fails without it) and reviewed with the **`smartslurm-adversary`** skill
+  before on-cluster testing or an upstream push.
+- **EO ↔ repo-agent comms live in each fork's `.claude/` on its DEFAULT branch** (so notes are
+  findable without knowing a feature-branch name). EO → agent: `ntc-ecosystem.md` (context),
+  `ntc-todo.md` (backlog projection + open-brief index), `ntc-brief-<topic>.md` (ad-hoc job specs;
+  the brief names the branch the work targets). Agent → EO: append to repo-owned `ntc-changelog.md`
+  (EO harvests via `scripts/ntc-collect-changelogs.sh`). Agents read `ntc-ecosystem.md` + `ntc-todo.md`
+  + `ls .claude/ntc-brief-*.md` at session start. Full convention: `docs/update-workflow.md`.
