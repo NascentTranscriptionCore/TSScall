@@ -165,16 +165,6 @@ def readInReferenceAnnotation(annotation_file):
     return reference_annotation, all_gtf_keys
 
 
-def _group_cmp(a_strand, a_chrom, b_strand, b_chrom):
-    # Mirrors the (strand, chromosome) key ordering used by isLessThan and
-    # sortList: plain Python string comparison, strand first then chromosome.
-    if a_strand != b_strand:
-        return -1 if a_strand < b_strand else 1
-    if a_chrom != b_chrom:
-        return -1 if a_chrom < b_chrom else 1
-    return 0
-
-
 class BedGraph(object):
     # Compact, behavior-preserving replacement for the original
     # list-of-single-nucleotide-dicts. In the original, combineAndSortBedGraphs
@@ -585,56 +575,59 @@ class TSSCalling(object):
         return sortList(filter_windows, 'sort_by_strand')
 
     def filterBedGraphListByWindows(self, bedgraph_list, filter_windows):
-        # FILTER BY OVERLAP WITH FILTER WINDOWS.
-        # Faithful reproduction of the original single global merge-walk over
-        # the sorted bedGraph vs. the sorted filter_windows, operating on the
-        # grouped arrays. A single global filter-window cursor (filter_index) is
-        # carried across (strand, chromosome) groups so that cross-group
-        # advancement matches isLessThan exactly.
+        # Drop every covered position that falls inside a filter window (masking
+        # coverage near known TSSs prior to uTSS calling), per (strand,
+        # chromosome) group with searchsorted instead of the original single
+        # global merge-walk over every position.
         #
         # PRESERVED LEGACY BEHAVIOR (do not "fix" without a decision):
-        #   The original while-loop terminates as soon as filter_index reaches
-        #   the end of filter_windows, so any bedGraph positions ordered AFTER
-        #   the last filter window are dropped (they never reach working_list) --
-        #   both the remainder of the current group and every later group. This
-        #   silently discards uTSS candidates past the last filter window. It is
-        #   reproduced verbatim here; see the '_tail_dropped' break below.
+        #   The original walk shares ONE filter-window cursor across all groups
+        #   and stops as soon as that cursor passes the LAST filter window, so
+        #   every position ordered after it -- the remainder of its group AND
+        #   every later group -- is silently discarded (dropping uTSS candidates
+        #   past the last known TSS). filter_windows is sorted by
+        #   (strand, chromosome, start), so that cutoff is exactly the last
+        #   window; here it is an explicit global truncation at (last_key,
+        #   last_end), not an emergent cursor side effect. A position ordered
+        #   after the last window is always dropped -- either it is inside a
+        #   window (masked) or it is past all of them (tail-dropped) -- so the
+        #   truncation is correct even when windows overlap.
         if filter_windows == []:
             return bedgraph_list
 
-        FW = filter_windows
-        nfw = len(FW)
-        filter_index = 0
-        new_bg = BedGraph()
+        windows_by_key = {}
+        for w in filter_windows:
+            windows_by_key.setdefault(
+                (w['strand'], w['chromosome']), []).append(w)
+        last_w = filter_windows[-1]
+        last_key = (last_w['strand'], last_w['chromosome'])
+        last_end = last_w['end']
 
+        new_bg = BedGraph()
         for key in bedgraph_list.order:
-            if filter_index >= nfw:
-                break  # legacy tail-drop: remaining groups discarded
-            strand, chrom = key
+            if key > last_key:
+                break  # legacy tail-drop: groups after the last filter window
             group = bedgraph_list.groups[key]
             pos = group['pos']
             reads = group['reads']
-            n = len(pos)
-            keep = np.zeros(n, dtype=bool)
-            bedgraph_index = 0
-            while (filter_index < nfw) and (bedgraph_index < n):
-                w = FW[filter_index]
-                gc = _group_cmp(strand, chrom, w['strand'], w['chromosome'])
-                if gc == 0:
-                    p = pos[bedgraph_index]
-                    if w['start'] <= p <= w['end']:      # within -> drop
-                        bedgraph_index += 1
-                    elif p < w['start']:                 # before window -> keep
-                        keep[bedgraph_index] = True
-                        bedgraph_index += 1
-                    else:                                # past window -> advance
-                        filter_index += 1
-                elif gc < 0:                             # bg group < window group
-                    keep[bedgraph_index] = True          #   isLessThan -> keep
-                    bedgraph_index += 1
-                else:                                    # window group < bg group
-                    filter_index += 1                    #   advance window
-            # positions not reached before filter windows ran out are dropped
+            keep = np.ones(len(pos), dtype=bool)
+            wins = windows_by_key.get(key)
+            if wins:
+                # batched, int32 query arrays (no per-call scalar promotion of
+                # pos); mark [start, end] of each window as dropped.
+                starts = np.fromiter((w['start'] for w in wins),
+                                     dtype=np.int32, count=len(wins))
+                ends = np.fromiter((w['end'] for w in wins),
+                                   dtype=np.int32, count=len(wins))
+                los = np.searchsorted(pos, starts, side='left')
+                his = np.searchsorted(pos, ends, side='right')
+                for lo, hi in zip(los.tolist(), his.tolist()):
+                    keep[lo:hi] = False
+            if key == last_key:
+                # legacy tail-drop within the last window's group: discard every
+                # position ordered after the last filter window's end.
+                cut = int(np.searchsorted(pos, np.int32(last_end), side='right'))
+                keep[cut:] = False
             idx = np.nonzero(keep)[0]
             if len(idx):
                 new_bg.add_group(key, pos[idx], reads[idx])
