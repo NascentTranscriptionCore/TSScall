@@ -507,14 +507,22 @@ class TSSCalling(object):
     # FIND INTERSECTION WITH SEARCH_WINDOWS, BEDGRAPH_LIST;
     # HITS ARE ADDED TO WINDOW_LIST, REQUIRES SORTED LIST
     def findIntersectionWithBedGraph(self, search_windows, bedgraph_list):
-        # In the original global merge-walk, a hit is recorded only when the
-        # bedGraph position and the window share strand AND chromosome (isWithin
-        # requires it); across (strand, chromosome) boundaries the walk merely
-        # advances indices. Grouping the (already globally-sorted) windows by
-        # (strand, chromosome) and walking each group's positions against its
-        # windows therefore produces identical hits and identical window order.
-        # search_windows is globally sorted, so per-key window lists stay sorted
-        # by start.
+        # Record, per window, [position, reads] for every covered position within
+        # [start, end] on the same (strand, chromosome), in ascending position
+        # order.
+        #
+        # The original did a single global merge-walk that stepped a cursor
+        # through EVERY bedGraph position, including the long gaps between
+        # windows -- O(N) even when the windows cover a tiny fraction of the
+        # genome (the obsTSS pass over full coverage). The windows reaching this
+        # method are non-overlapping and sorted by start within each
+        # (strand, chromosome) group: both builders merge overlaps
+        # (createSearchWindowsFromAnnotation splits touching windows at their
+        # midpoint; createUnannotatedSearchWindowsFromBedgraph fuses overlapping
+        # ones). With non-overlapping windows each position belongs to at most
+        # one window, so two np.searchsorted bounds per window select exactly its
+        # hits -- identical membership (start <= pos <= end), identical ascending
+        # order -- while touching only hits + windows*log(N) positions, not all N.
         windows_by_key = {}
         for w in search_windows:
             windows_by_key.setdefault(
@@ -526,21 +534,26 @@ class TSSCalling(object):
                 continue
             pos = group['pos']
             reads = group['reads']
-            n = len(pos)
-            nw = len(win_list)
-            bedgraph_index = 0
-            search_index = 0
-            while (search_index < nw) and (bedgraph_index < n):
-                w = win_list[search_index]
-                p = pos[bedgraph_index]
-                if w['start'] <= p <= w['end']:          # isWithin (same group)
-                    w['hits'].append(
-                        [int(p), int(reads[bedgraph_index])])
-                    bedgraph_index += 1
-                elif p < w['start']:                     # isLessThan (same group)
-                    bedgraph_index += 1
-                else:
-                    search_index += 1
+            # Batch the bound searches: one searchsorted over all window starts
+            # and one over all ends. The query arrays are int32 (matching pos),
+            # so there is no per-call scalar promotion of the whole pos array --
+            # each call is a single O(windows*log N) C routine. The per-window
+            # Python loop below then only slices and appends the hits it found.
+            starts = np.fromiter((w['start'] for w in win_list),
+                                 dtype=np.int32, count=len(win_list))
+            ends = np.fromiter((w['end'] for w in win_list),
+                               dtype=np.int32, count=len(win_list))
+            los = np.searchsorted(pos, starts, side='left')
+            his = np.searchsorted(pos, ends, side='right')
+            for i, w in enumerate(win_list):
+                lo = int(los[i])
+                hi = int(his[i])
+                if hi > lo:
+                    # == appending [int(p), int(reads[i])] for each position in
+                    # [start, end] ascending; tolist() yields Python ints.
+                    w['hits'].extend(
+                        map(list, zip(pos[lo:hi].tolist(),
+                                      reads[lo:hi].tolist())))
 
     # CREATE WINDOWS ABOUT KNOWN TSS FOR UNANNOTATED TSSs CALLING;
     # CONSIDERS ANNOTATED AND CALLED TSSs IN INSTANCE LISTS
