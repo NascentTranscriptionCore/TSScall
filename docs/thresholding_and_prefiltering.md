@@ -111,6 +111,53 @@ well as plain-max. Switching call methods buys nothing here.
 
 See **Background**. Use an explicit fixed threshold instead.
 
+### 4. The call-min threshold is a clean, location-stable sensitivity knob
+
+With pre-filtering removed, sensitivity is controlled entirely by the calling
+threshold (`--set_read_threshold`; via GGA `--tsscallMin`). Unlike pre-filtering,
+the threshold is well-behaved. Bare TSScall (obsTSS + uTSS, no GGA layer) on raw
+data across the 8 loci:
+
+| threshold | obsTSS | uTSS | total | obsTSS median dist→annTSS | % ≤100 bp |
+|-----------|-------:|-----:|------:|--------------------------:|----------:|
+| min1 (floor) | 24 | 1136 | 1160 | 315 bp | 33% |
+| min2         | 23 |  882 |  905 | 331 bp | 35% |
+| min4         | 23 |  539 |  562 | 331 bp | 35% |
+| min6         | 22 |  329 |  351 | 315 bp | 36% |
+| **min8**     | 16 |  225 |  241 | **196 bp** | **44%** |
+| min10        | 12 |  167 |  179 | 266 bp | 42% |
+| min12        |  9 |  133 |  142 | 202 bp | 44% |
+
+(`--set_read_threshold 0` is **not** a valid call-min — it fails the
+"a threshold method was set" check in `__init__` and silently falls back to FDR,
+so **min1 is the floor**. FDR on a single window picks T=2, identical to min2,
+and is not genome-representative — see §3.)
+
+Three properties make it a sound sensitivity dial:
+
+- **Monotonic / nested.** Raising the threshold is almost pure subtraction:
+  stepping min4→min6→min8→min10→min12 drops 220 / 112 / 63 / 39 calls while
+  adding only 9 / 2 / 1 / 2 and shifting 0–4. Higher-threshold calls are
+  essentially a subset of lower-threshold calls — the opposite of
+  pre-filtering's reshuffle (§1), which dropped *and* added in comparable
+  numbers.
+- **Location-stable.** When a uTSS survives across thresholds, its coordinate
+  does not move: of uTSS appearing at ≥2 thresholds, **93% sit at the exact same
+  base at every threshold** (median position spread 0 bp), and **98–100%** match
+  the min8 position exactly. The threshold changes *membership*, not *position*.
+- **obsTSS agreement peaks ~min8.** obsTSS stay ~constant (~23) up to min6, then
+  the farthest-from-annotation calls drop out; median distance to the annotated
+  TSS improves 331→196 bp and % within 100 bp rises 35→44% by min8, with no
+  further gain above it. This is where the lab's `--tsscallMin 8` default sits.
+
+**Implication (incl. DOBBE / bare TSScall).** Control sensitivity with the
+call-min, not pre-filtering. It is primarily a uTSS knob (uTSS swing 1136→133
+across the range; obsTSS only 24→9), it subsets cleanly, and the anchors it
+keeps stay at the same coordinates — so for uTSS/enhancer-anchor use (DOBBE) the
+min is a pure sensitivity/specificity dial, with no worry that kept calls move.
+~min8 is a sound default. (obsTSS counts here are small, 9–24; treat the fine
+agreement wiggles as noisy — the min4→min8 improvement is the signal.)
+
 ---
 
 ## Where the GGA "shifts" actually come from
