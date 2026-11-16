@@ -22,8 +22,10 @@
 #   4. Window merges in createSearchWindowsFromAnnotation and
 #      createUnannotatedSearchWindowsFromBedgraph: list.pop(0) O(n^2) -> index
 #      cursor O(n) (identical output order).
+#   5. bedGraph parsing: per-line / per-position Python loop -> pandas C parser
+#      + numpy range-expansion (identical (position, read) multiset per group).
 #
-# Requires numpy. Python 2.7 or 3.
+# Requires numpy and pandas. Python 3.
 #
 # TWO PRE-EXISTING BEHAVIORS ARE PRESERVED VERBATIM so that output matches the
 # original exactly. Both silently discard data and are almost certainly bugs;
@@ -40,9 +42,9 @@ import math
 import argparse
 import sys
 from operator import itemgetter
-from array import array
 
 import numpy as np
+import pandas as pd
 
 
 def writeBedHeader(file_name, description, OUTPUT):
@@ -375,46 +377,79 @@ class TSSCalling(object):
         return merged_windows
 
     def combineAndSortBedGraphs(self, forward_bedgraph, reverse_bedgraph):
-        # Behavior-preserving compact reader. Same line filtering and same
-        # single-nucleotide expansion as the original readBedGraph (a line
-        # spanning [start, end) contributes one position per integer in
-        # range(start+1, end+1), each carrying the line's read count), but
-        # positions accumulate into C-backed int64 arrays grouped by
-        # (strand, chromosome) instead of one Python dict each.
+        # Behavior-preserving vectorized reader. Reproduces the original
+        # readBedGraph exactly -- skip any line containing 'track' or a blank
+        # line, then expand each line [start, end) into one position per integer
+        # in range(start+1, end+1) carrying the line's read count, grouped by
+        # (strand, chromosome) and sorted by position -- but parses the four
+        # bedGraph columns with the pandas C parser and expands the ranges with
+        # numpy, instead of a Python per-line / per-position loop.
+        #
+        # bedGraph is tab-delimited (UCSC/bedtools standard; the NTC pipelines
+        # emit tab-separated 1-nt bedGraphs). Leading header/blank lines are
+        # skipped so the C parser infers the column count from a data row; any
+        # remaining non-numeric row (a stray 'track' line) is then dropped by the
+        # numeric coercion and the chromosome filter.
 
-        def readBedGraph(acc, bedgraph_fn, strand):
+        def _is_int(tok):
+            t = tok[1:] if tok[:1] == '-' else tok
+            return t.isdigit()
+
+        def read_one(bedgraph_fn, strand):
+            # Skip leading header/blank lines so the first row the parser sees is
+            # a 4-column data row (otherwise the column count is inferred from a
+            # 'track' header). Reads only the leading lines, not the whole file.
+            skip = 0
             with open(bedgraph_fn) as f:
                 for line in f:
-                    if not ('track' in line or line == '\n'):
-                        chromosome, start, end, reads = line.strip().split()
-                        start = int(start)
-                        end = int(end)
-                        reads = int(reads)
-                        key = (strand, chromosome)
-                        pair = acc.get(key)
-                        if pair is None:
-                            pair = [array('q'), array('q')]
-                            acc[key] = pair
-                        pos_arr, read_arr = pair
-                        for i in range(start + 1, end + 1):
-                            pos_arr.append(i)
-                            read_arr.append(reads)
+                    p = line.split()
+                    if (len(p) >= 4 and _is_int(p[1]) and _is_int(p[2])
+                            and _is_int(p[3])):
+                        break
+                    skip += 1
+                else:
+                    return {}   # no data rows
 
-        acc = {}
-        readBedGraph(acc, forward_bedgraph, '+')
-        readBedGraph(acc, reverse_bedgraph, '-')
+            df = pd.read_csv(
+                bedgraph_fn, sep='\t', header=None, usecols=[0, 1, 2, 3],
+                names=['chrom', 'start', 'end', 'reads'], skiprows=skip,
+                skip_blank_lines=True, dtype={'chrom': 'category'},
+                keep_default_na=False, na_values=[''], comment=None,
+            )
+            # Coerce coordinates to integers; a header/blank row becomes NaN and
+            # is dropped. Also drop any row whose chromosome contains 'track' --
+            # the only way the original's 'track' filter fires on a row whose
+            # coordinate columns are otherwise numeric.
+            for col in ('start', 'end', 'reads'):
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=['start', 'end', 'reads'])
+            df = df[~df['chrom'].str.contains('track', regex=False, na=False)]
+
+            groups = {}
+            for chrom, sub in df.groupby('chrom', sort=False, observed=True):
+                start = sub['start'].to_numpy(dtype=np.int64)
+                end = sub['end'].to_numpy(dtype=np.int64)
+                reads = sub['reads'].to_numpy(dtype=np.int64)
+                # Expand each interval [start, end) to positions start+1..end.
+                widths = np.maximum(end - start, 0)
+                total = int(widths.sum())
+                reads_exp = np.repeat(reads, widths)
+                starts_exp = np.repeat(start + 1, widths)
+                # within-interval offset 0..width-1 for each expanded position
+                offset = np.arange(total) - np.repeat(
+                    np.cumsum(widths) - widths, widths)
+                pos_exp = starts_exp + offset
+                groups[(strand, chrom)] = (pos_exp, reads_exp)
+            return groups
 
         bg = BedGraph()
-        for key in list(acc.keys()):
-            pos_arr, read_arr = acc.pop(key)
-            pos_v = np.frombuffer(pos_arr, dtype=np.int64)
-            read_v = np.frombuffer(read_arr, dtype=np.int64)
-            # Sort within group by position (== sortList's 'start' key; strand
-            # and chromosome are constant within a group). Positions are unique
-            # per group, so ordering is fully determined.
-            order = np.argsort(pos_v, kind='stable')
-            bg.add_group(key, np.array(pos_v[order]), np.array(read_v[order]))
-            del pos_arr, read_arr, pos_v, read_v, order
+        for strand, path in (('+', forward_bedgraph), ('-', reverse_bedgraph)):
+            for key, (pos_exp, reads_exp) in read_one(path, strand).items():
+                # Sort within group by position. strand and chromosome are
+                # constant within a group and positions are unique, so this
+                # reproduces the original sortList('sort_by_strand') order.
+                order = np.argsort(pos_exp, kind='stable')
+                bg.add_group(key, pos_exp[order], reads_exp[order])
         bg.finalize_order()
         return bg
 
