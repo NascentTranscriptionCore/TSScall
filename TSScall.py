@@ -16,8 +16,9 @@
 #      prefix sum. Same OVERLAPPING, hit-anchored sliding windows as the
 #      original (NOT fixed tiling); identical totals and identical tie-breaking.
 #   2. bedGraph storage: one Python dict per single-nt position (~350 B) ->
-#      compact per-(strand,chromosome) int64 numpy arrays (~16-24 B). This is
-#      what removes the memory wall that forced pre-filtering.
+#      compact per-(strand,chromosome) int32 numpy arrays (~8 B/position;
+#      genome-wide reductions accumulate in int64). This is what removes the
+#      memory wall that forced pre-filtering.
 #   3. countLoci / total read count: vectorized (identical values).
 #   4. Window merges in createSearchWindowsFromAnnotation and
 #      createUnannotatedSearchWindowsFromBedgraph: list.pop(0) O(n^2) -> index
@@ -182,9 +183,9 @@ class BedGraph(object):
     # sorted by (strand, chromosome, start). That cost ~340 bytes/position.
     #
     # Here, positions are grouped by (strand, chromosome); each group holds two
-    # parallel numpy arrays (pos, reads) in ascending-position order (~8 bytes
-    # per int). Iterating self.order (sorted keys) and, within each group, the
-    # pos array ascending, reproduces the EXACT global order that
+    # parallel numpy int32 arrays (pos, reads) in ascending-position order
+    # (~4 bytes per int). Iterating self.order (sorted keys) and, within each
+    # group, the pos array ascending, reproduces the EXACT global order that
     # sortList(..., 'sort_by_strand') produced on the original list, because:
     #   - the original sort key is (strand_str, chromosome_str, start_int);
     #   - sorted() over (strand, chromosome) tuple keys uses the same string
@@ -205,8 +206,11 @@ class BedGraph(object):
         self.order = sorted(self.groups.keys())
 
     def total_reads(self):
-        # == sum(entry['reads'] for entry in bedgraph_list)
-        return int(sum(int(g['reads'].sum()) for g in self.groups.values()))
+        # == sum(entry['reads'] for entry in bedgraph_list). reads arrays are
+        # int32; accumulate in int64 so the genome-wide total (FDR path) cannot
+        # overflow -- a deep library exceeds 2^31 total reads.
+        return int(sum(int(g['reads'].sum(dtype=np.int64))
+                       for g in self.groups.values()))
 
     def count_loci(self, value):
         # == countLoci(bedgraph_list, value): number of single-nt positions
@@ -427,9 +431,13 @@ class TSSCalling(object):
 
             groups = {}
             for chrom, sub in df.groupby('chrom', sort=False, observed=True):
+                # Coordinates are computed in int64 (overflow-safe); the stored
+                # coverage arrays are int32. Positions (<= ~250 M) and per-
+                # position read counts both fit in int32, halving the dominant
+                # memory consumer. Values -- hence output -- are unchanged.
                 start = sub['start'].to_numpy(dtype=np.int64)
                 end = sub['end'].to_numpy(dtype=np.int64)
-                reads = sub['reads'].to_numpy(dtype=np.int64)
+                reads = sub['reads'].to_numpy(dtype=np.int32)
                 # Expand each interval [start, end) to positions start+1..end.
                 widths = np.maximum(end - start, 0)
                 total = int(widths.sum())
@@ -438,7 +446,7 @@ class TSSCalling(object):
                 # within-interval offset 0..width-1 for each expanded position
                 offset = np.arange(total) - np.repeat(
                     np.cumsum(widths) - widths, widths)
-                pos_exp = starts_exp + offset
+                pos_exp = (starts_exp + offset).astype(np.int32)
                 groups[(strand, chrom)] = (pos_exp, reads_exp)
             return groups
 
