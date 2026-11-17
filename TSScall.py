@@ -27,6 +27,11 @@
 #      cursor O(n) (identical output order).
 #   5. bedGraph parsing: per-line / per-position Python loop -> pandas C parser
 #      + numpy range-expansion (identical (position, read) multiset per group).
+#   6. window hits stored columnar (per-window int32 position/read arrays, as
+#      slices of the group arrays) instead of a Python list-of-pairs: the
+#      intersection materializes no list, hit removal is a vectorized mask, and
+#      hits memory roughly halves. bin_winner/global selection runs on the
+#      per-window tolist() lists, so the tie-breaks stay byte-identical.
 #
 # Requires numpy and pandas. Python 3.
 #
@@ -50,6 +55,10 @@ from operator import itemgetter
 
 import numpy as np
 import pandas as pd
+
+# Shared read-only empty coverage array: the hit columns of a window that
+# received no intersecting positions (never mutated, so sharing is safe).
+_EMPTY_I32 = np.array([], dtype=np.int32)
 
 
 def writeBedHeader(file_name, description, OUTPUT):
@@ -302,7 +311,8 @@ class TSSCalling(object):
                 'tss': [self.reference_annotation[ref]['tss']],
                 'strand': self.reference_annotation[ref]['strand'],
                 'gene_id': [self.reference_annotation[ref]['gene_id']],
-                'hits': [],
+                'hits_pos': _EMPTY_I32,
+                'hits_reads': _EMPTY_I32,
                 'gtf_fields': self.reference_annotation[ref]['gtf_fields'],
             })
             if self.reference_annotation[ref]['strand'] == '+':
@@ -543,11 +553,13 @@ class TSSCalling(object):
                 lo = int(los[i])
                 hi = int(his[i])
                 if hi > lo:
-                    # == appending [int(p), int(reads[i])] for each position in
-                    # [start, end] ascending; tolist() yields Python ints.
-                    w['hits'].extend(
-                        map(list, zip(pos[lo:hi].tolist(),
-                                      reads[lo:hi].tolist())))
+                    # Store the window's hits as columnar int32 arrays (slices of
+                    # the group arrays, ascending position) -- no Python
+                    # list-of-pairs is materialized. A slice is a view; the
+                    # parent group array stays alive (the view holds it), so this
+                    # is safe even after a filtered BedGraph goes out of scope.
+                    w['hits_pos'] = pos[lo:hi]
+                    w['hits_reads'] = reads[lo:hi]
 
     # CREATE WINDOWS ABOUT KNOWN TSS FOR UNANNOTATED TSSs CALLING;
     # CONSIDERS ANNOTATED AND CALLED TSSs IN INSTANCE LISTS
@@ -643,7 +655,8 @@ class TSSCalling(object):
                     'chromosome': chromosome,
                     'start': p - self.utss_search_window,
                     'end': p + self.utss_search_window,
-                    'hits': []
+                    'hits_pos': _EMPTY_I32,
+                    'hits_reads': _EMPTY_I32,
                     })
 
         # MERGE OVERLAPPING WINDOWS.
@@ -807,10 +820,7 @@ class TSSCalling(object):
 
     def createDetailFile(self):
         def checkHits(window):
-            for hit in window['hits']:
-                if hit[1] >= self.read_threshold:
-                    return True
-            return False
+            return bool(np.any(window['hits_reads'] >= self.read_threshold))
 
         def writeUnobservedEntry(OUTPUT, tss, tr_ids, gene_ids, window):
             tss_id = getID('annoTSS', self.unobserved_ref_count)
@@ -823,9 +833,9 @@ class TSSCalling(object):
                 genes += ';' + gene_ids[i]
 
             reads = 0
-            for hit in window['hits']:
-                if int(tss) == int(hit[0]):
-                    reads = hit[1]
+            match = window['hits_pos'] == int(tss)
+            if match.any():
+                reads = int(window['hits_reads'][match][-1])
 
             OUTPUT.write(('{}' + '\t{}' * 15)
                          .format(
@@ -1014,37 +1024,42 @@ class TSSCalling(object):
     # COUNT IS RETURNED IN ORDER TO UPDATE INSTANCE VARIABLES
     def callTSSsFromIntersection(self, intersection, read_threshold, base_name,
                                  count, tss_type, nearest_allowed):
-        def callTSS(hits, strand):
+        # callTSS operates on the columnar hits of a window: hp = positions
+        # (int32, ascending, unique), hr = reads (int32). The selection itself
+        # runs on Python lists (hp.tolist()/hr.tolist() is a single C-level
+        # conversion) so the tight inner loop uses fast list indexing rather than
+        # per-element numpy scalar extraction, and so that small windows -- the
+        # common case -- pay no per-call numpy overhead. Returns Python ints.
+        def callTSS(hp, hr, strand):
+            pos = hp.tolist()
+            reads = hr.tolist()
+            n = len(pos)
             if self.call_method == 'global':
                 max_reads = float('-inf')
                 max_position = None
-                for hit in hits:
-                    if hit[1] > max_reads:
-                        max_position = hit[0]
-                        max_reads = hit[1]
-                    elif hit[1] == max_reads:
+                for i in range(n):
+                    if reads[i] > max_reads:
+                        max_position = pos[i]
+                        max_reads = reads[i]
+                    elif reads[i] == max_reads:
                         if strand == '+':
-                            if hit[0] < max_position:
-                                max_position = hit[0]
+                            if pos[i] < max_position:
+                                max_position = pos[i]
                         elif strand == '-':
-                            if hit[0] > max_position:
-                                max_position = hit[0]
+                            if pos[i] > max_position:
+                                max_position = pos[i]
                 return max_position, max_reads
             if self.call_method == 'bin_winner':
+                # O(H) two-pointer + prefix sum. One OVERLAPPING bin anchored at
+                # each hit i covers [pos_i, pos_i + bin_size] (hits are position-
+                # sorted, so the span runs forward) -- NOT a fixed tiling. The bin
+                # with the greatest total reads wins (first strict max = lowest-
+                # index bin), and the highest-read position in it wins (first
+                # strict max = lowest position).
                 bin_size = self.bin_winner_size
-                # O(H) EQUIVALENT OF THE ORIGINAL O(H^2) BINNING.
-                # ORIGINAL: one OVERLAPPING bin anchored at every hit i,
-                # covering [pos_i, pos_i + bin_size] (forward span, because
-                # hits are position-sorted and j runs from i upward). This
-                # slides a hit-anchored window; it does NOT tile the axis.
-                # Two-pointer reproduces the identical bins/totals/ties.
-                hits.sort(key=itemgetter(0))
-                n = len(hits)
                 prefix = [0] * (n + 1)
                 for k in range(n):
-                    prefix[k + 1] = prefix[k] + hits[k][1]
-                # SELECT BIN WITH HIGHEST TOTAL READS
-                # BECAUSE SORTED, WILL TAKE UPSTREAM BIN IN TIES (first strict max)
+                    prefix[k + 1] = prefix[k] + reads[k]
                 max_bin_reads = float('-inf')
                 max_bin_index = None
                 win_r = None
@@ -1052,30 +1067,29 @@ class TSSCalling(object):
                 for i in range(n):
                     if r < i:
                         r = i
-                    while r + 1 < n and hits[r + 1][0] - hits[i][0] <= bin_size:
+                    while r + 1 < n and pos[r + 1] - pos[i] <= bin_size:
                         r += 1
                     total_reads = prefix[r + 1] - prefix[i]
                     if total_reads > max_bin_reads:
                         max_bin_reads = total_reads
                         max_bin_index = i
                         win_r = r
-                # GET LOCAL WINNER
-                # BECAUSE SORTED, WILL TAKE UPSTREAM TSS IN TIES (first strict max)
                 max_reads = float('-inf')
                 max_position = None
                 for k in range(max_bin_index, win_r + 1):
-                    if hits[k][1] > max_reads:
-                        max_position = hits[k][0]
-                        max_reads = hits[k][1]
+                    if reads[k] > max_reads:
+                        max_position = pos[k]
+                        max_reads = reads[k]
                 return max_position, max_reads
 
         # ITERATE THROUGH WINDOWS IN INTERSECTION
         for entry in intersection:
-            entry_hits = entry['hits']
-            # LOOP WHILE 'HITS' IS POPULATED
-            while len(entry_hits) != 0:
+            hp = entry['hits_pos']
+            hr = entry['hits_reads']
+            # LOOP WHILE HITS REMAIN
+            while len(hp) != 0:
                 # CALL A TSS
-                tss_position, tss_reads = callTSS(entry_hits, entry['strand'])
+                tss_position, tss_reads = callTSS(hp, hr, entry['strand'])
                 if tss_reads >= read_threshold:
                     self.tss_list.append({
                         'id': getID(base_name, count),
@@ -1090,12 +1104,10 @@ class TSSCalling(object):
                         if val in entry:
                             self.tss_list[-1][val] = entry[val]
                     count += 1
-                # GO THROUGH HITS, KEEP THOSE WITHIN NEAREST_ALLOWED
-                temp = []
-                for hit in entry_hits:
-                    if abs(hit[0] - tss_position) > nearest_allowed:
-                        temp.append(hit)
-                entry_hits = temp
+                # KEEP HITS FARTHER THAN NEAREST_ALLOWED FROM THE CALLED TSS
+                keep = np.abs(hp - tss_position) > nearest_allowed
+                hp = hp[keep]
+                hr = hr[keep]
         return count
 
     def callTSSsFromAnnotation(self, bedgraph_list, read_threshold):
