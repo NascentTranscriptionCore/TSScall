@@ -131,40 +131,51 @@ Since the refactor makes full-depth calling feasible, the recommendation is to
 makes the threshold mean exactly what it says. The peak-overlap analyzer used
 for this analysis is in [`benchmark/`](benchmark/) (`analyze_overlap.py`).
 
-## Preserved upstream behaviors
+## Two terminal-region bugs: preserved through the refactor, then fixed
 
-To keep output byte-identical to upstream, the refactor **reproduces two
-pre-existing behaviors of the original that silently drop uTSS signal.** Both
-are marked in the code (`PRESERVED LEGACY BEHAVIOR`). They are almost certainly
-unintended, and they are documented here so the choice to keep them is
-explicit — a maintainer who "fixes" them will change output relative to
-upstream and to any published results, which should be a conscious decision.
+The performance changes above were kept byte-identical to upstream, which meant
+**reproducing two pre-existing bugs of the original that silently drop uTSS
+signal.** They were then **fixed in a separate, clearly-labeled commit** (search
+the code for `BEHAVIOR CHANGE`). This is the only intended difference from the
+original's output.
 
-Scope of both: **uTSS only** (annotated obsTSS calls are unaffected, because
-the annotated pass uses a different window builder and the unfiltered
-coverage), and both are **end-of-sort-order effects**, confined to the terminal
-region of the last lexically-sorted chromosome (plus any unannotated scaffolds
-that sort after it). They are disjoint, sitting on opposite sides of the
-window that is intentionally masked around the last known TSS.
+Scope of both: **uTSS only** (annotated obsTSS calls are unaffected — the
+annotated pass uses a different window builder and the unfiltered coverage), and
+both are **end-of-sort-order effects**, confined to the terminal region of the
+last lexically-sorted chromosome (minus strand, plus any scaffolds that sort
+after it). They are disjoint, sitting on opposite sides of the window masked
+around the last known TSS.
 
-1. **Filter tail-drop** (`filterBedGraphListByWindows`). When masking coverage
-   near known TSSs prior to uTSS calling, the merge-walk terminates as soon as
-   the filter windows are exhausted, discarding every coverage position ordered
-   *after* the last filter window. Effect: uTSS candidates past the last
-   annotated/called TSS on the terminal chromosome (minus strand) are never
-   seeded. The lost span is the distance from that last TSS to the end of
-   coverage — data-dependent, potentially large in sequence but sparse in
-   actual calls.
+1. **Filter tail-drop** (`filterBedGraphListByWindows`). The original merge-walk
+   terminated as soon as the filter windows were exhausted, discarding every
+   coverage position ordered *after* the last filter window — so uTSS candidates
+   past the last annotated/called TSS on the terminal chromosome were never
+   seeded. **Fixed:** the vectorized filter masks and keeps every group (no
+   truncation).
 
 2. **Dropped final uTSS window**
-   (`createUnannotatedSearchWindowsFromBedgraph`). The window-merge loop does
-   not append its final accumulated window, so the single last (highest-sorted)
-   uTSS search window is dropped — costing the peak(s) that one window would
-   have produced (typically one, occasionally a few).
+   (`createUnannotatedSearchWindowsFromBedgraph`). The window-merge loop did not
+   append its final accumulated window, dropping the single last (highest-sorted)
+   uTSS search window. **Fixed:** the final window is now appended.
 
-If you choose to fix these, do it as a separate, clearly-labeled commit on top
-of the byte-identical version, so "matches upstream" and "fixed" remain
-distinct, checkout-able points in history.
+### What the fix changes (and what it does not)
+
+The fix is a **strict, confined improvement**: it recovers the terminal uTSS the
+original silently dropped, appended with the highest uTSS IDs, and wires their
+bidirectional partners. **Every other call — ID, position, reads, type — is
+byte-identical.** Verified by diffing against the byte-identical build: all
+changes fall in the last chromosome's terminal cluster (minus strand), the only
+existing-call changes are divergent/convergent partner fields pointing at the
+recovered neighbors, and the per-cluster member count updates accordingly. On
+the synthetic sets here the effect was +1 to +2 uTSS per run. The differential
+fuzz test (`benchmark/equivalence/filter_equiv.py`) shows the removed tail-drop
+would have changed the filter output in ~74% of random cases, so the footprint
+is real, just confined to the sort tail.
+
+**For the original-vs-improved comparison:** check out the byte-identical commit
+to compare performance against the pristine original with no output confound
+(`comparison.tsv` all YES/YES); check out this commit to adopt the corrected
+calls and quantify the recovered uTSS with `benchmark/analyze_overlap.py`.
 
 ## Reproducing the validation
 

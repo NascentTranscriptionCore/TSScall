@@ -7,9 +7,11 @@
 #
 # ---------------------------------------------------------------------------
 # PERFORMANCE REFACTOR (single-node). Statistical approach UNCHANGED.
-# Verified to produce byte-identical BED and detail output to the original
-# across bin_winner / global / FDR / no-annotation configurations, plus unit
-# fuzz tests for the two rewritten hot paths.
+# The performance changes (1-5 below) produce byte-identical BED and detail
+# output to the original across bin_winner / global / FDR / no-annotation
+# configurations, each covered by a differential fuzz test. Two pre-existing
+# terminal-region bugs were then FIXED (see below), which is the ONLY intended
+# difference from the original's output.
 #
 # Changes, each result-preserving:
 #   1. bin_winner TSS selection: O(H^2) per window -> O(H) via a two-pointer +
@@ -28,14 +30,16 @@
 #
 # Requires numpy and pandas. Python 3.
 #
-# TWO PRE-EXISTING BEHAVIORS ARE PRESERVED VERBATIM so that output matches the
-# original exactly. Both silently discard data and are almost certainly bugs;
-# they are left intact and clearly marked (search "PRESERVED LEGACY BEHAVIOR")
-# so the decision to keep or fix them is explicit, not accidental:
-#   (a) filterBedGraphListByWindows drops every bedGraph position ordered after
-#       the last filter window (uTSS candidates past the last known TSS).
-#   (b) createUnannotatedSearchWindowsFromBedgraph drops the final (highest-
+# TWO PRE-EXISTING BUGS, both silently dropping uTSS candidates in the terminal
+# region (the end of the last lexically-sorted chromosome, minus strand), were
+# preserved through the performance refactor and then FIXED as a separate,
+# labeled change (search "BEHAVIOR CHANGE"):
+#   (a) filterBedGraphListByWindows dropped every bedGraph position ordered
+#       after the last filter window (uTSS candidates past the last known TSS).
+#   (b) createUnannotatedSearchWindowsFromBedgraph dropped the final (highest-
 #       sorted) uTSS search window.
+# Fixing them recovers those terminal uTSS (and wires their bidirectional
+# partners); every other call is unchanged. See PERFORMANCE.md.
 # ---------------------------------------------------------------------------
 
 import os
@@ -577,21 +581,15 @@ class TSSCalling(object):
     def filterBedGraphListByWindows(self, bedgraph_list, filter_windows):
         # Drop every covered position that falls inside a filter window (masking
         # coverage near known TSSs prior to uTSS calling), per (strand,
-        # chromosome) group with searchsorted instead of the original single
-        # global merge-walk over every position.
+        # chromosome) group with batched searchsorted (int32 query arrays, so
+        # pos is not promoted per call).
         #
-        # PRESERVED LEGACY BEHAVIOR (do not "fix" without a decision):
-        #   The original walk shares ONE filter-window cursor across all groups
-        #   and stops as soon as that cursor passes the LAST filter window, so
-        #   every position ordered after it -- the remainder of its group AND
-        #   every later group -- is silently discarded (dropping uTSS candidates
-        #   past the last known TSS). filter_windows is sorted by
-        #   (strand, chromosome, start), so that cutoff is exactly the last
-        #   window; here it is an explicit global truncation at (last_key,
-        #   last_end), not an emergent cursor side effect. A position ordered
-        #   after the last window is always dropped -- either it is inside a
-        #   window (masked) or it is past all of them (tail-dropped) -- so the
-        #   truncation is correct even when windows overlap.
+        # BEHAVIOR CHANGE (fixed; was PRESERVED LEGACY BEHAVIOR): the original
+        # shared ONE filter-window cursor across all groups and stopped as soon
+        # as it passed the LAST filter window, silently discarding every position
+        # ordered after it -- the rest of that group and every later group -- so
+        # uTSS candidates past the last known TSS were never seeded. That
+        # terminal-region tail-drop is removed: every group is masked and kept.
         if filter_windows == []:
             return bedgraph_list
 
@@ -599,22 +597,15 @@ class TSSCalling(object):
         for w in filter_windows:
             windows_by_key.setdefault(
                 (w['strand'], w['chromosome']), []).append(w)
-        last_w = filter_windows[-1]
-        last_key = (last_w['strand'], last_w['chromosome'])
-        last_end = last_w['end']
 
         new_bg = BedGraph()
         for key in bedgraph_list.order:
-            if key > last_key:
-                break  # legacy tail-drop: groups after the last filter window
             group = bedgraph_list.groups[key]
             pos = group['pos']
             reads = group['reads']
             keep = np.ones(len(pos), dtype=bool)
             wins = windows_by_key.get(key)
             if wins:
-                # batched, int32 query arrays (no per-call scalar promotion of
-                # pos); mark [start, end] of each window as dropped.
                 starts = np.fromiter((w['start'] for w in wins),
                                      dtype=np.int32, count=len(wins))
                 ends = np.fromiter((w['end'] for w in wins),
@@ -623,11 +614,6 @@ class TSSCalling(object):
                 his = np.searchsorted(pos, ends, side='right')
                 for lo, hi in zip(los.tolist(), his.tolist()):
                     keep[lo:hi] = False
-            if key == last_key:
-                # legacy tail-drop within the last window's group: discard every
-                # position ordered after the last filter window's end.
-                cut = int(np.searchsorted(pos, np.int32(last_end), side='right'))
-                keep[cut:] = False
             idx = np.nonzero(keep)[0]
             if len(idx):
                 new_bg.add_group(key, pos[idx], reads[idx])
@@ -665,9 +651,9 @@ class TSSCalling(object):
         # call -> O(M^2) for M qualifying positions (can be very large on deep
         # data); the cursor is O(M). Merge logic and output order are unchanged.
         #
-        # PRESERVED LEGACY BEHAVIOR (do not "fix" without a decision): the
-        # original does NOT append the final working_entry after the loop, so
-        # the last (highest-sorted) uTSS window is dropped. Reproduced verbatim.
+        # BEHAVIOR CHANGE (fixed; was PRESERVED LEGACY BEHAVIOR): the original
+        # did NOT append the final working_entry after the loop, dropping the
+        # last (highest-sorted) uTSS search window. It is now appended.
         merged_windows = []
         if len(windows) == 0:
             # The original would raise IndexError on windows.pop(0) here; on real
@@ -690,6 +676,7 @@ class TSSCalling(object):
             else:
                 merged_windows.append(working_entry)
                 working_entry = next_entry
+        merged_windows.append(working_entry)
         return merged_windows
 
     # SORT CALLED TSSs AND ASSOCIATE INTO BIDIRECTIONAL PAIRS
