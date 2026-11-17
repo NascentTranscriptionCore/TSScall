@@ -28,7 +28,7 @@ DRY=0
 
 # sanity checks (skipped in dry mode so you can preview before wiring paths)
 if [[ $DRY -eq 0 ]]; then
-    for f in "$ORIG_SCRIPT" "$REFAC_SCRIPT" "$FWD" "$REV" "$CHROMSIZES" "$GTF"; do
+    for f in "$ORIG_SCRIPT" "$REFAC_SCRIPT" "$IMPROVED_SCRIPT" "$FWD" "$REV" "$CHROMSIZES" "$GTF"; do
         [[ -e "$f" ]] || { echo "ERROR: missing input: $f" >&2; exit 1; }
     done
 fi
@@ -39,7 +39,7 @@ METRICS="$RESULTS_DIR/metrics.tsv"
 : > "$MANIFEST"
 printf 'script\tpreFilt\tcallThresh\trc\twall_s\tmaxrss_kb\tsacct_maxrss\tsacct_elapsed\tbed_lines\tbed_md5\tdetail_md5\n' > "$METRICS"
 
-script_path() { case "$1" in orig) echo "$ORIG_SCRIPT";; refac) echo "$REFAC_SCRIPT";; esac; }
+script_path() { case "$1" in orig) echo "$ORIG_SCRIPT";; refac) echo "$REFAC_SCRIPT";; improved) echo "$IMPROVED_SCRIPT";; esac; }
 
 # Submit and return a clean job id. sbatch --parsable prints "jobid" or
 # "jobid;cluster" on one line; take the first token, strip whitespace.

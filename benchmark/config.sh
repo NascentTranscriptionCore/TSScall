@@ -12,10 +12,25 @@
 #                 calling threshold), applied to whatever input survived.
 
 # ---- Scripts under test ------------------------------------------------------
-# ORIG_SCRIPT  : the current/original TSScall.py
-# REFAC_SCRIPT : the refactored TSScall.py
-ORIG_SCRIPT="/path/to/original/TSScall.py"
-REFAC_SCRIPT="/path/to/TSScall_refactored.py"
+# Three versions, for the time + peak-memory comparison:
+#   ORIG_SCRIPT     : the pristine original Lavender TSScall.py (O(H^2) bin_winner,
+#                     one dict per single-nt position). e.g. a checkout of
+#                     GeneAnnotationScripts/TSScall-master/TSScall.py.
+#   REFAC_SCRIPT    : the byte-identical bin_winner refactor (numpy coverage arrays +
+#                     two-pointer bin_winner), i.e. the "refac baseline" commit BEFORE
+#                     the parse/int32/searchsorted work. Byte-identical to ORIG, so
+#                     comparison.tsv (orig-vs-refac) should read YES/YES everywhere.
+#   IMPROVED_SCRIPT : the current head -- vectorized parse (pandas) + int32 coverage
+#                     arrays + searchsorted intersection & filter + the two terminal-uTSS
+#                     bug fixes. Faster and leaner than REFAC. Its output differs from
+#                     ORIG/REFAC ONLY by the recovered terminal uTSS, so it is excluded
+#                     from the identity table by design (characterize that delta with
+#                     analyze_overlap.py / run_overlap.sh instead).
+# NOTE: ORIG needs numpy only if you use a numpy-era original; the pristine Lavender
+# is pure Python. IMPROVED additionally requires pandas (see ../requirements.txt).
+ORIG_SCRIPT="/path/to/original/TSScall-master/TSScall.py"
+REFAC_SCRIPT="/path/to/TSScall_refac_baseline.py"
+IMPROVED_SCRIPT="/path/to/TSScall.py"
 
 # ---- Input data (a single, lower-depth full PRO-seq dataset) -----------------
 # FWD/REV are the UNFILTERED bedGraphs (all reads). The harness derives the
@@ -30,12 +45,16 @@ GTF="/path/to/annotation.gtf"
 EXPNAME="proseq_test"
 
 # ---- Condition matrix --------------------------------------------------------
-# SCRIPTS          : which scripts to run (keys map to the two paths above).
+# SCRIPTS          : which scripts to run (keys map to the three paths above).
 # PREFILT_LEVELS   : pre-filter cutoffs (see preFilt above). 1 = no pre-filter.
+#                    NB: at preFilt=1 on full-depth data the ORIGINAL is expected to
+#                    OOM (that is the headline result -- it cannot run un-pre-filtered
+#                    on these nodes); REFAC and IMPROVED run. The harness records the
+#                    non-zero rc, so an OOM cell is informative, not a harness failure.
 # CALLTHRESH_LEVELS: values passed to --set_read_threshold (see callThresh).
 # The axes are independent: preFilt trims the input bedGraph on disk;
 # callThresh is the cutoff TSScall applies internally to whatever survived.
-SCRIPTS=(orig refac)
+SCRIPTS=(orig refac improved)
 PREFILT_LEVELS=(1 4 8)
 CALLTHRESH_LEVELS=(4 6 8 10)
 
