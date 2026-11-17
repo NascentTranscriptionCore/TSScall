@@ -1,0 +1,8 @@
+{
+  "source": "ntc-ecosystem-context",
+  "skill": "tsscall",
+  "meta_sha": "006b425",
+  "generated": "2026-11-12",
+  "managed_paths": [".claude/skills/tsscall", ".claude/ntc-ecosystem.md", ".claude/reference/runAsPipeline-grammar.md", ".claude/ntc-coding-style.md", "REVIEW.md", ".claude/ntc-todo.md", ".claude/ntc-stub.json", "CLAUDE.md (marked block)"],
+  "repo_owned_paths": [".claude/ntc-changelog.md"]
+}

@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Confirm the grouped filter exactly reproduces the original list-based filter,
-including the legacy tail-drop and cross-(strand,chrom) cursor behavior."""
+"""Confirm the vectorized filter implements the intended behavior -- keep every
+covered position that is NOT inside any filter window -- after the legacy
+tail-drop was removed.
+
+The original filter shared one global filter-window cursor and silently dropped
+every position ordered after the LAST filter window (a terminal-region bug).
+That tail-drop has been removed; this test checks the searchsorted filter now
+equals a plain "keep if outside every window" reference, and reports how often
+the removed tail-drop would have changed the result.
+"""
 import random
+
 import numpy as np
 
 
-# ---- original logic, verbatim ----
+# ---- old list-based filter, verbatim (WITH the tail-drop) -- kept only to
+#      measure how often the removed bug actually changed the output ----
 def isWithin(e1, e2):
     if e1['strand'] == e2['strand'] and e1['chromosome'] == e2['chromosome']:
         if e1['start'] >= e2['start'] and e1['end'] <= e2['end']:
@@ -40,49 +50,40 @@ def original_filter(bedgraph_list, filter_windows):
     return bedgraph_list
 
 
-# ---- refactored grouped logic (mirrors TSScall_refactored) ----
-def _group_cmp(a_s, a_c, b_s, b_c):
-    if a_s != b_s:
-        return -1 if a_s < b_s else 1
-    if a_c != b_c:
-        return -1 if a_c < b_c else 1
-    return 0
+# ---- intended (fixed) behavior: keep positions outside every filter window ----
+def correct_filter(entries, fw):
+    def in_any(e):
+        return any(e['strand'] == w['strand']
+                   and e['chromosome'] == w['chromosome']
+                   and w['start'] <= e['start'] <= w['end'] for w in fw)
+    return [e for e in entries if not in_any(e)]
 
 
-def grouped_filter(order, groups, filter_windows):
+# ---- searchsorted grouped filter (mirrors TSScall filterBedGraphListByWindows,
+#      tail-drop removed) ----
+def searchsorted_filter(order, groups, filter_windows):
     if filter_windows == []:
         return order, groups
-    FW = filter_windows
-    nfw = len(FW)
-    fi = 0
+    windows_by_key = {}
+    for w in filter_windows:
+        windows_by_key.setdefault(
+            (w['strand'], w['chromosome']), []).append(w)
     new_groups = {}
     new_order = []
     for key in order:
-        if fi >= nfw:
-            break
-        strand, chrom = key
         pos = groups[key]['pos']
         reads = groups[key]['reads']
-        n = len(pos)
-        keep = np.zeros(n, dtype=bool)
-        bi = 0
-        while (fi < nfw) and (bi < n):
-            w = FW[fi]
-            gc = _group_cmp(strand, chrom, w['strand'], w['chromosome'])
-            if gc == 0:
-                p = pos[bi]
-                if w['start'] <= p <= w['end']:
-                    bi += 1
-                elif p < w['start']:
-                    keep[bi] = True
-                    bi += 1
-                else:
-                    fi += 1
-            elif gc < 0:
-                keep[bi] = True
-                bi += 1
-            else:
-                fi += 1
+        keep = np.ones(len(pos), dtype=bool)
+        wins = windows_by_key.get(key)
+        if wins:
+            starts = np.fromiter((w['start'] for w in wins), dtype=np.int32,
+                                 count=len(wins))
+            ends = np.fromiter((w['end'] for w in wins), dtype=np.int32,
+                               count=len(wins))
+            los = np.searchsorted(pos, starts, side='left')
+            his = np.searchsorted(pos, ends, side='right')
+            for lo, hi in zip(los.tolist(), his.tolist()):
+                keep[lo:hi] = False
         idx = np.nonzero(keep)[0]
         if len(idx):
             new_groups[key] = {'pos': pos[idx], 'reads': reads[idx]}
@@ -93,7 +94,6 @@ def grouped_filter(order, groups, filter_windows):
 def make_case(rng):
     chroms = ['chr1', 'chr2', 'chr10']       # note string order chr1<chr10<chr2
     strands = ['+', '-']
-    # bedgraph: unique (strand,chrom,pos)
     entries = []
     for s in strands:
         for c in chroms:
@@ -103,7 +103,6 @@ def make_case(rng):
                 entries.append({'strand': s, 'chromosome': c, 'start': p,
                                 'end': p, 'reads': rng.randint(1, 9)})
     entries.sort(key=lambda e: (e['strand'], e['chromosome'], e['start']))
-    # filter windows: random, then sorted like sortList('sort_by_strand')
     fw = []
     for _ in range(rng.randint(0, 6)):
         s = rng.choice(strands)
@@ -116,46 +115,51 @@ def make_case(rng):
 
 
 def to_groups(entries):
-    order = []
-    groups = {}
     from collections import OrderedDict
     tmp = OrderedDict()
     for e in entries:
         tmp.setdefault((e['strand'], e['chromosome']), []).append(e)
+    order = []
+    groups = {}
     for key in sorted(tmp.keys()):
         arr = tmp[key]
-        groups[key] = {'pos': np.array([a['start'] for a in arr]),
-                       'reads': np.array([a['reads'] for a in arr])}
+        groups[key] = {'pos': np.array([a['start'] for a in arr], dtype=np.int32),
+                       'reads': np.array([a['reads'] for a in arr], dtype=np.int32)}
         order.append(key)
     return order, groups
+
+
+def keys_of(order, groups):
+    out = []
+    for key in order:
+        for p in groups[key]['pos']:
+            out.append((key[0], key[1], int(p)))
+    return out
 
 
 def main():
     rng = random.Random(99)
     trials = 40000
     mism = 0
-    tail_exercised = 0
+    bug_footprint = 0
     for _ in range(trials):
         entries, fw = make_case(rng)
-        kept_orig = original_filter(list(entries), fw)
-        orig_keys = [(e['strand'], e['chromosome'], e['start']) for e in kept_orig]
+        correct = [(e['strand'], e['chromosome'], e['start'])
+                   for e in correct_filter(entries, fw)]
         order, groups = to_groups(entries)
-        norder, ngroups = grouped_filter(order, groups, fw)
-        new_keys = []
-        for key in norder:
-            for p in ngroups[key]['pos']:
-                new_keys.append((key[0], key[1], int(p)))
-        if orig_keys != new_keys:
+        got = keys_of(*searchsorted_filter(order, groups, fw))
+        if got != correct:
             mism += 1
             if mism <= 3:
-                print("MISMATCH")
-                print(" orig:", orig_keys)
-                print(" new :", new_keys)
-        # did this case drop a tail? (some entry kept by neither-within/before)
-        if fw and len(kept_orig) < len([e for e in entries]):
-            tail_exercised += 1
-    print(f"trials={trials}  mismatches={mism}  "
-          f"cases_where_filter_removed_something={tail_exercised}")
+                print("MISMATCH\n correct:", correct, "\n got    :", got)
+        old = [(e['strand'], e['chromosome'], e['start'])
+               for e in original_filter(list(entries), fw)]
+        if old != correct:
+            bug_footprint += 1
+    print("trials={}  mismatches(fixed filter vs intended)={}".format(
+        trials, mism))
+    print("cases where the removed tail-drop had changed the result: {}".format(
+        bug_footprint))
     print("PASS" if mism == 0 else "FAIL")
 
 

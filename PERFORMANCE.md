@@ -1,23 +1,27 @@
 # Performance refactor
 
-This document describes the performance refactor of `TSScall.py` in this fork:
-what changed, why the output is identical to upstream, the measured speed and
-memory gains, and two upstream behaviors that were deliberately preserved.
+This document describes the performance work on `TSScall.py` in this fork: what
+changed, why the performance changes keep output byte-identical to upstream, the
+measured speed and memory gains, and two terminal-region bugs that were
+preserved through the refactor and then fixed.
 
 ## Summary
 
-The refactor targets two independent scaling walls in the original: a runtime
-bottleneck in per-window TSS calling, and a memory bottleneck in how coverage
-is represented. Neither the calling logic nor the statistics were changed. On
-every configuration tested — `bin_winner`, `global`, FDR-selected threshold,
-and no-annotation — and on both synthetic and full-depth real PRO-seq data, the
-refactored script produces **byte-identical BED and detail output** to upstream
-(verified by md5).
+The work has two parts. First, a **performance refactor** that removes the
+original's scaling walls — the O(H²) per-window calling, the dict-per-position
+memory, and the per-position Python passes for parsing, window intersection and
+filtering — while changing neither the calling logic nor the statistics. Across
+every configuration tested (`bin_winner`, `global`, FDR-selected threshold,
+no-annotation; synthetic and full-depth real PRO-seq) it produces
+**byte-identical BED and detail output** to upstream, verified by md5 and by a
+differential fuzz test for each rewritten path. Second, a single **labeled
+behavior fix** correcting two pre-existing terminal-region bugs — the only
+intended difference from the original's output (see the last section).
 
 The practical outcome: full-depth calling with no pre-filtering, previously
-impossible on our nodes (OOM at 90 GB), now runs in ~30 GB and well under an
-hour; and where the original completes at all, the refactor is tens to
-hundreds of times faster with identical results.
+impossible on our nodes (OOM at 90 GB), now runs in tens of GB and minutes; and
+where the original completes at all, the refactor is tens to hundreds of times
+faster with identical results.
 
 ## What changed
 
@@ -45,13 +49,15 @@ already O(H) and is unchanged.
 
 The original expands the input into one Python dict per single-nucleotide
 position (`~340` bytes each), so a few hundred million covered positions
-require 100+ GB. The refactor stores coverage as compact `numpy` `int64` arrays
-of positions and reads, grouped by `(strand, chromosome)` — dropping the
-redundant per-row `chromosome`, `strand`, and `end` fields — at roughly
-`16–24` bytes per position. Grouping by `(strand, chromosome)` is equivalent to
-the original global `(strand, chromosome, start)` sort, so every downstream
-merge-walk (threshold scan, window intersection, filtering, uTSS seeding)
-operates on the grouped arrays and yields identical results.
+require 100+ GB. The refactor stores coverage as compact `numpy` `int32` arrays
+of positions and reads (positions ≤ ~250 M and read counts both fit in int32),
+grouped by `(strand, chromosome)` — dropping the redundant per-row
+`chromosome`, `strand`, and `end` fields — at **8 bytes per position**. Any
+genome-wide reduction (the FDR read-count sum) accumulates in `int64` so it
+cannot overflow. Grouping by `(strand, chromosome)` is equivalent to the
+original global `(strand, chromosome, start)` sort, so every downstream pass
+(threshold scan, window intersection, filtering, uTSS seeding) operates on the
+grouped arrays and yields identical results.
 
 ### 3. Vectorized threshold computation
 
@@ -66,14 +72,55 @@ call and therefore O(n²) overall — a hidden quadratic that could dominate on
 deep data. Both now use an index cursor (O(n)). The merge logic and output
 order are unchanged.
 
+### 5. C-level bedGraph parsing
+
+The per-line, per-position Python read loop (split + int + append, once per
+covered position) was the threshold-independent runtime floor. It is replaced
+by a pandas C-parser read of the four bedGraph columns plus a numpy
+range-expansion (`np.repeat`), yielding the same `(position, read)` multiset per
+`(strand, chromosome)` group. The chromosome column is read as a categorical so
+the parse-time DataFrame stays lean at full depth. Adds a `pandas` dependency.
+
+### 6. Window intersection by searchsorted
+
+`findIntersectionWithBedGraph` previously walked a cursor through *every*
+position, including the long gaps between windows — O(N) even when windows cover
+a tiny fraction of the genome (the obsTSS pass over full coverage). The windows
+reaching it are non-overlapping and sorted, so each position belongs to at most
+one window; two batched `np.searchsorted` bounds per group select every
+window's hits at once, O(hits + windows·log N). The query arrays are int32 to
+match the coverage, which avoids a per-call promotion of the whole position
+array (a naive per-window, Python-scalar searchsorted was ~10× *slower* than
+the walk — the batched, typed form is the fix).
+
+### 7. Filter by searchsorted
+
+`filterBedGraphListByWindows` (masking coverage near known TSSs before uTSS
+calling) likewise walked every position; it now masks each group with batched
+`searchsorted` bounds over that group's filter windows.
+
+### 8. Columnar window hits
+
+Each search window's hits were a Python list of `[position, reads]` pairs —
+across all windows a large fraction of N as boxed ints. They are now two int32
+arrays per window (slices of the group arrays): the intersection materializes
+no list, hit removal is a vectorized mask, and the `bin_winner`/`global`
+selection runs on a single `tolist()` conversion so the tight inner loop keeps
+fast list indexing (a fully vectorized selection was slower on the many small
+windows). This roughly halves the hits memory.
+
 ## Correctness: how "identical" was verified
 
-- **Unit fuzz tests.** The two rewritten hot paths were checked against the
-  original implementations on randomized inputs: 60,000 trials for the
-  `bin_winner` two-pointer and 40,000 trials for the grouped filter, **zero
-  mismatches** in both. A fixed-tiling model (the tempting but wrong refactor)
-  diverged on ~19,800 of the `bin_winner` trials, confirming the test detects
-  the difference. See [`benchmark/equivalence/`](benchmark/equivalence/).
+- **Differential fuzz tests.** Each rewritten hot path is checked against the
+  original (or intended) implementation on tens of thousands of randomized
+  inputs, **zero mismatches** in every one
+  ([`benchmark/equivalence/`](benchmark/equivalence/)):
+  `binwinner_equiv` (60,000), `filter_equiv` (40,000), `parse_equiv` (20,000),
+  `intersect_equiv` (40,000), `int32_equiv` (20,000 + an explicit >2³¹
+  read-count overflow check). Several carry a negative control that *diverges*,
+  confirming the test is sensitive: a fixed-tiling model on ~19,800 `bin_winner`
+  trials, overlapping windows on ~7,400 `intersect` trials, and the removed
+  filter tail-drop on ~29,700 `filter` trials.
 - **End-to-end, synthetic.** BED body and detail file are md5-identical to
   upstream across the production configuration, `global`, FDR, and
   no-annotation modes.
@@ -109,6 +156,29 @@ The dict-per-position expansion is exactly what the columnar arrays replace,
 which is why the gap between original and refactored widens with depth — modest
 on small pre-filtered inputs, decisive at full depth.
 
+### Further optimizations (changes 5–8): synthetic 3-way, real-data pending
+
+The table above is **original vs. the bin_winner-refactor baseline**
+(changes 1–4). Changes 5–8 (C-level parse, searchsorted intersection/filter,
+columnar hits) add more speed and memory on top; full-depth real-data numbers
+for this "improved" build are pending the cluster run. The
+[`benchmark/`](benchmark/) harness is wired for a three-way comparison
+(`SCRIPTS=(orig refac improved)` in `config.sh`), recording wall time and peak
+RSS per cell. As a stand-in, a 6 M-position synthetic
+(`--set_read_threshold 8`, with annotation) gives:
+
+| version | wall time | peak RSS |
+|:--|--:|--:|
+| original (pristine Lavender) | 71.6 s | 2.20 GB |
+| refac baseline (changes 1–4) | 18.3 s | 0.87 GB |
+| improved (changes 1–8) | 8.0 s | 0.64 GB |
+
+On this synthetic the improved build is ~9× faster and ~3.4× leaner than the
+original, and ~2.3× faster than the refac baseline. The synthetic over-weights
+the uTSS-calling path (it is unusually uTSS-dense), so the *shape* of the gain
+on real data will differ — the full-depth cluster run is the authoritative
+measurement.
+
 ## Pre-filtering is unnecessary and lossy
 
 Because the original's memory forced many users to strip low-count positions
@@ -131,40 +201,51 @@ Since the refactor makes full-depth calling feasible, the recommendation is to
 makes the threshold mean exactly what it says. The peak-overlap analyzer used
 for this analysis is in [`benchmark/`](benchmark/) (`analyze_overlap.py`).
 
-## Preserved upstream behaviors
+## Two terminal-region bugs: preserved through the refactor, then fixed
 
-To keep output byte-identical to upstream, the refactor **reproduces two
-pre-existing behaviors of the original that silently drop uTSS signal.** Both
-are marked in the code (`PRESERVED LEGACY BEHAVIOR`). They are almost certainly
-unintended, and they are documented here so the choice to keep them is
-explicit — a maintainer who "fixes" them will change output relative to
-upstream and to any published results, which should be a conscious decision.
+The performance changes above were kept byte-identical to upstream, which meant
+**reproducing two pre-existing bugs of the original that silently drop uTSS
+signal.** They were then **fixed in a separate, clearly-labeled commit** (search
+the code for `BEHAVIOR CHANGE`). This is the only intended difference from the
+original's output.
 
-Scope of both: **uTSS only** (annotated obsTSS calls are unaffected, because
-the annotated pass uses a different window builder and the unfiltered
-coverage), and both are **end-of-sort-order effects**, confined to the terminal
-region of the last lexically-sorted chromosome (plus any unannotated scaffolds
-that sort after it). They are disjoint, sitting on opposite sides of the
-window that is intentionally masked around the last known TSS.
+Scope of both: **uTSS only** (annotated obsTSS calls are unaffected — the
+annotated pass uses a different window builder and the unfiltered coverage), and
+both are **end-of-sort-order effects**, confined to the terminal region of the
+last lexically-sorted chromosome (minus strand, plus any scaffolds that sort
+after it). They are disjoint, sitting on opposite sides of the window masked
+around the last known TSS.
 
-1. **Filter tail-drop** (`filterBedGraphListByWindows`). When masking coverage
-   near known TSSs prior to uTSS calling, the merge-walk terminates as soon as
-   the filter windows are exhausted, discarding every coverage position ordered
-   *after* the last filter window. Effect: uTSS candidates past the last
-   annotated/called TSS on the terminal chromosome (minus strand) are never
-   seeded. The lost span is the distance from that last TSS to the end of
-   coverage — data-dependent, potentially large in sequence but sparse in
-   actual calls.
+1. **Filter tail-drop** (`filterBedGraphListByWindows`). The original merge-walk
+   terminated as soon as the filter windows were exhausted, discarding every
+   coverage position ordered *after* the last filter window — so uTSS candidates
+   past the last annotated/called TSS on the terminal chromosome were never
+   seeded. **Fixed:** the vectorized filter masks and keeps every group (no
+   truncation).
 
 2. **Dropped final uTSS window**
-   (`createUnannotatedSearchWindowsFromBedgraph`). The window-merge loop does
-   not append its final accumulated window, so the single last (highest-sorted)
-   uTSS search window is dropped — costing the peak(s) that one window would
-   have produced (typically one, occasionally a few).
+   (`createUnannotatedSearchWindowsFromBedgraph`). The window-merge loop did not
+   append its final accumulated window, dropping the single last (highest-sorted)
+   uTSS search window. **Fixed:** the final window is now appended.
 
-If you choose to fix these, do it as a separate, clearly-labeled commit on top
-of the byte-identical version, so "matches upstream" and "fixed" remain
-distinct, checkout-able points in history.
+### What the fix changes (and what it does not)
+
+The fix is a **strict, confined improvement**: it recovers the terminal uTSS the
+original silently dropped, appended with the highest uTSS IDs, and wires their
+bidirectional partners. **Every other call — ID, position, reads, type — is
+byte-identical.** Verified by diffing against the byte-identical build: all
+changes fall in the last chromosome's terminal cluster (minus strand), the only
+existing-call changes are divergent/convergent partner fields pointing at the
+recovered neighbors, and the per-cluster member count updates accordingly. On
+the synthetic sets here the effect was +1 to +2 uTSS per run. The differential
+fuzz test (`benchmark/equivalence/filter_equiv.py`) shows the removed tail-drop
+would have changed the filter output in ~74% of random cases, so the footprint
+is real, just confined to the sort tail.
+
+**For the original-vs-improved comparison:** check out the byte-identical commit
+to compare performance against the pristine original with no output confound
+(`comparison.tsv` all YES/YES); check out this commit to adopt the corrected
+calls and quantify the recovered uTSS with `benchmark/analyze_overlap.py`.
 
 ## Reproducing the validation
 
